@@ -1,0 +1,47 @@
+services:
+  resplat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-9.0}
+        MAX_JOBS: ${MAX_JOBS:-8}
+    image: resplat:cuda12.8-gh200
+    container_name: resplat
+    working_dir: /workspace/resplat
+    gpus: all
+    ipc: host
+    shm_size: "32gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility,graphics}
+      TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-9.0}
+      MAX_JOBS: ${MAX_JOBS:-8}
+      FORCE_CUDA: "1"
+      CUDA_HOME: /usr/local/cuda
+      PYTHONPATH: /workspace/resplat
+      HF_HOME: /workspace/.cache/huggingface
+      TORCH_HOME: /workspace/.cache/torch
+      MPLCONFIGDIR: /workspace/.cache/matplotlib
+      WANDB_DIR: /workspace/.cache/wandb
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-${HF_TOKEN:-}}
+      WANDB_API_KEY: ${WANDB_API_KEY:-}
+      RESPLAT_CMD: ${RESPLAT_CMD:-}
+    volumes:
+      - .:/workspace/resplat
+      - resplat-cache:/workspace/.cache
+    command: >
+      bash -lc 'if [ -n "$$RESPLAT_CMD" ]; then
+      exec bash -lc "$$RESPLAT_CMD";
+      else
+      exec sleep infinity;
+      fi'
+    stdin_open: true
+    tty: true
+
+volumes:
+  resplat-cache:
