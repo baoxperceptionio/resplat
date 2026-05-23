@@ -7,10 +7,14 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
+
+VIDEO_EXTENSIONS = {".mp4", ".mov"}
+DEFAULT_SAMPLE_FPS = 4.0
 
 PRESET_SHAPES = {
     "dl3dv_8v_512x960": (512, 960),
@@ -54,6 +58,31 @@ def colmap_gpu_option(command: str, new_option: str, legacy_option: str) -> str:
     )
 
 
+def registered_image_count(model_path: Path) -> int:
+    result = subprocess.run(
+        ["colmap", "model_analyzer", "--path", str(model_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    output = result.stdout + result.stderr
+    match = re.search(r"Registered images:\s+(\d+)", output)
+    if match is None:
+        raise RuntimeError(f"Could not read registered image count for {model_path}")
+    return int(match.group(1))
+
+
+def largest_colmap_reconstruction(sparse_dir: Path) -> Path:
+    reconstructions = sorted(p for p in sparse_dir.iterdir() if p.is_dir())
+    if not reconstructions:
+        raise RuntimeError("COLMAP mapper did not produce a sparse reconstruction")
+
+    best = max(reconstructions, key=registered_image_count)
+    count = registered_image_count(best)
+    print(f"Selected COLMAP reconstruction: {best} ({count} registered images)")
+    return best
+
+
 def ffprobe_json(video: Path) -> dict:
     result = subprocess.run(
         [
@@ -83,6 +112,25 @@ def video_duration_seconds(video: Path) -> float:
     return duration
 
 
+def video_paths(input_path: Path) -> list[Path]:
+    if input_path.is_file():
+        if input_path.suffix.lower() not in VIDEO_EXTENSIONS:
+            raise ValueError(f"Input file is not an MP4/MOV video: {input_path}")
+        return [input_path]
+
+    if input_path.is_dir():
+        videos = sorted(
+            p
+            for p in input_path.rglob("*")
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+        )
+        if not videos:
+            raise FileNotFoundError(f"No MP4/MOV videos found under {input_path}")
+        return videos
+
+    raise FileNotFoundError(input_path)
+
+
 def reset_dir(path: Path, overwrite: bool) -> None:
     if path.exists():
         if not overwrite:
@@ -93,14 +141,7 @@ def reset_dir(path: Path, overwrite: bool) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def extract_frames(
-    video: Path,
-    image_dir: Path,
-    num_frames: int,
-    start_time: float,
-    end_time: float | None,
-) -> None:
-    reset_dir(image_dir, overwrite=True)
+def time_window(video: Path, start_time: float, end_time: float | None) -> tuple[float, float]:
     video_duration = video_duration_seconds(video)
     if start_time < 0:
         raise ValueError("--start_time must be non-negative")
@@ -111,15 +152,35 @@ def extract_frames(
     end = video_duration if end_time is None else min(end_time, video_duration)
     if end <= start_time:
         raise ValueError("--end_time must be after --start_time")
+    return start_time, end
+
+
+def frame_count(video: Path, args: argparse.Namespace) -> int:
+    if args.num_frames is not None:
+        if args.num_frames <= 0:
+            raise ValueError("--num_frames must be positive")
+        return args.num_frames
+
+    start, end = time_window(video, args.start_time, args.end_time)
+    return max(1, math.ceil((end - start) * args.sample_fps))
+
+
+def extract_video_frames(
+    video: Path,
+    image_dir: Path,
+    num_frames: int,
+    start_time: float,
+    end_time: float | None,
+    filename_prefix: str,
+) -> int:
+    start_time, end = time_window(video, start_time, end_time)
     duration = end - start_time
-    if num_frames <= 0:
-        raise ValueError("--num_frames must be positive")
 
     # Sample from bin centers so the first/last frames are not overly likely to
     # be black transition frames.
     for i in range(num_frames):
         timestamp = min(end - 1e-3, start_time + (i + 0.5) * duration / num_frames)
-        output = image_dir / f"frame_{i:05d}.jpg"
+        output = image_dir / f"{filename_prefix}_frame_{i:05d}.jpg"
         run(
             [
                 "ffmpeg",
@@ -139,22 +200,46 @@ def extract_frames(
             ]
         )
 
+    return num_frames
+
+
+def extract_frames(videos: list[Path], image_dir: Path, args: argparse.Namespace) -> int:
+    reset_dir(image_dir, overwrite=True)
+    total = 0
+    for video_index, video in enumerate(videos):
+        count = frame_count(video, args)
+        print(f"  {video}: extracting {count} frames")
+        total += extract_video_frames(
+            video,
+            image_dir,
+            count,
+            args.start_time,
+            args.end_time,
+            f"video_{video_index:03d}",
+        )
+
     extracted = sorted(image_dir.glob("*.jpg"))
-    if len(extracted) != num_frames:
-        raise RuntimeError(f"Expected {num_frames} frames, extracted {len(extracted)}")
+    if len(extracted) != total:
+        raise RuntimeError(f"Expected {total} frames, extracted {len(extracted)}")
+    return total
 
 
-def run_colmap(raw_images: Path, colmap_dir: Path, scene_dir: Path, use_gpu: int) -> None:
+def run_colmap(
+    raw_images: Path,
+    colmap_dir: Path,
+    scene_dir: Path,
+    use_gpu: int,
+    matcher: str,
+) -> None:
     database = colmap_dir / "database.db"
     sparse_dir = colmap_dir / "sparse"
-    mapper_output = sparse_dir / "0"
     extraction_gpu_option = colmap_gpu_option(
         "feature_extractor",
         "--FeatureExtraction.use_gpu",
         "--SiftExtraction.use_gpu",
     )
     matching_gpu_option = colmap_gpu_option(
-        "sequential_matcher",
+        matcher,
         "--FeatureMatching.use_gpu",
         "--SiftMatching.use_gpu",
     )
@@ -178,18 +263,16 @@ def run_colmap(raw_images: Path, colmap_dir: Path, scene_dir: Path, use_gpu: int
             str(use_gpu),
         ]
     )
-    run(
-        [
-            "colmap",
-            "sequential_matcher",
-            "--database_path",
-            str(database),
-            "--SequentialMatching.overlap",
-            "10",
-            matching_gpu_option,
-            str(use_gpu),
-        ]
-    )
+    match_cmd = [
+        "colmap",
+        matcher,
+        "--database_path",
+        str(database),
+    ]
+    if matcher == "sequential_matcher":
+        match_cmd += ["--SequentialMatching.overlap", "10"]
+    match_cmd += [matching_gpu_option, str(use_gpu)]
+    run(match_cmd)
     run(
         [
             "colmap",
@@ -203,11 +286,7 @@ def run_colmap(raw_images: Path, colmap_dir: Path, scene_dir: Path, use_gpu: int
         ]
     )
 
-    if not mapper_output.exists():
-        reconstructions = sorted(p for p in sparse_dir.iterdir() if p.is_dir())
-        if not reconstructions:
-            raise RuntimeError("COLMAP mapper did not produce a sparse reconstruction")
-        mapper_output = reconstructions[0]
+    mapper_output = largest_colmap_reconstruction(sparse_dir)
 
     run(
         [
@@ -229,7 +308,12 @@ def run_colmap(raw_images: Path, colmap_dir: Path, scene_dir: Path, use_gpu: int
         raise RuntimeError(f"Undistorted COLMAP sparse files not found in {sparse_output}")
 
 
-def run_resplat(args: argparse.Namespace, scene_dir: Path, output_dir: Path) -> None:
+def run_resplat(
+    args: argparse.Namespace,
+    scene_dir: Path,
+    output_dir: Path,
+    frame_count: int,
+) -> None:
     cmd = [
         "python",
         "scripts/infer_colmap.py",
@@ -240,7 +324,7 @@ def run_resplat(args: argparse.Namespace, scene_dir: Path, output_dir: Path) -> 
         "--start_frame",
         "0",
         "--frame_distance",
-        str(args.num_frames),
+        str(frame_count),
         "--images_dir",
         "images",
         "--sparse_dir",
@@ -259,8 +343,8 @@ def run_resplat(args: argparse.Namespace, scene_dir: Path, output_dir: Path) -> 
 
     if args.num_context is not None:
         cmd += ["--num_context", str(args.num_context)]
-    elif args.num_frames < 8:
-        cmd += ["--num_context", str(args.num_frames)]
+    elif frame_count < 8:
+        cmd += ["--num_context", str(frame_count)]
 
     if args.image_shape is not None:
         cmd += ["--image_shape", str(args.image_shape[0]), str(args.image_shape[1])]
@@ -274,15 +358,32 @@ def run_resplat(args: argparse.Namespace, scene_dir: Path, output_dir: Path) -> 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract video frames, reconstruct cameras with COLMAP, and run ReSplat."
+        description=(
+            "Extract frames from one video or a folder of MP4/MOV videos, "
+            "reconstruct cameras with COLMAP, and run ReSplat."
+        )
     )
-    parser.add_argument("--video", required=True, type=Path, help="Input video path")
+    parser.add_argument(
+        "--video",
+        required=True,
+        type=Path,
+        help="Input video path, or a folder containing MP4/MOV videos from one scene",
+    )
     parser.add_argument(
         "-N",
         "--num_frames",
-        required=True,
+        default=None,
         type=int,
-        help="Number of frames to sample from the video",
+        help=(
+            "Number of frames to sample per video. "
+            "Default: sample each video at --sample_fps."
+        ),
+    )
+    parser.add_argument(
+        "--sample_fps",
+        type=float,
+        default=DEFAULT_SAMPLE_FPS,
+        help="Frames per second to sample from each video when --num_frames is omitted.",
     )
     parser.add_argument(
         "--work_dir",
@@ -299,7 +400,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scene_name",
         default=None,
-        help="Scene folder name. Default: <video_stem>-N<num_frames>",
+        help="Scene folder name. Default: <input_stem>-N<num_frames> or <input_stem>-fps<sample_fps>",
     )
     parser.add_argument(
         "--model_preset",
@@ -359,6 +460,12 @@ def parse_args() -> argparse.Namespace:
         help="Use GPU for COLMAP SIFT extraction/matching if this COLMAP build supports it.",
     )
     parser.add_argument(
+        "--matcher",
+        choices=["auto", "sequential", "exhaustive"],
+        default="auto",
+        help="COLMAP matcher. Default: sequential for one video, exhaustive for a folder.",
+    )
+    parser.add_argument(
         "--skip_colmap",
         action="store_true",
         help="Reuse an existing COLMAP scene in work_dir/scene_name/scene.",
@@ -382,11 +489,18 @@ def main() -> None:
     check_tool("ffprobe")
     check_tool("colmap")
 
-    video = args.video.resolve()
-    if not video.exists():
-        raise FileNotFoundError(video)
+    input_path = args.video.resolve()
+    videos = video_paths(input_path)
 
-    scene_name = args.scene_name or f"{video.stem}-N{args.num_frames}"
+    if args.num_frames is None and args.sample_fps <= 0:
+        raise ValueError("--sample_fps must be positive")
+
+    default_suffix = (
+        f"N{args.num_frames}"
+        if args.num_frames is not None
+        else f"fps{args.sample_fps:g}"
+    )
+    scene_name = args.scene_name or f"{input_path.stem}-{default_suffix}"
     root = args.work_dir / scene_name
     raw_images = root / "raw_images"
     colmap_dir = root / "colmap"
@@ -396,24 +510,35 @@ def main() -> None:
     if root.exists() and args.overwrite and not args.skip_colmap:
         shutil.rmtree(root)
     root.mkdir(parents=True, exist_ok=True)
+    total_frames = len(list((scene_dir / "images").glob("*"))) if args.skip_colmap else 0
 
     if not args.skip_colmap:
-        print(f"Extracting {args.num_frames} frames from {video}...")
-        extract_frames(
-            video,
-            raw_images,
-            args.num_frames,
-            args.start_time,
-            args.end_time,
-        )
+        print(f"Extracting frames from {len(videos)} video(s) under {input_path}...")
+        total_frames = extract_frames(videos, raw_images, args)
         if scene_dir.exists():
             shutil.rmtree(scene_dir)
+        matcher = args.matcher
+        if matcher == "auto":
+            matcher = "exhaustive" if len(videos) > 1 else "sequential"
+        matcher_command = f"{matcher}_matcher"
+        print(f"Using COLMAP matcher: {matcher_command}")
         print("Running COLMAP reconstruction and undistortion...")
-        run_colmap(raw_images, colmap_dir, scene_dir, args.colmap_use_gpu)
+        run_colmap(
+            raw_images,
+            colmap_dir,
+            scene_dir,
+            args.colmap_use_gpu,
+            matcher_command,
+        )
+
+    if total_frames <= 0:
+        total_frames = len(list((scene_dir / "images").glob("*")))
+    if total_frames <= 0:
+        raise RuntimeError("Could not determine the number of frames for ReSplat")
 
     if not args.skip_resplat:
         print("Running ReSplat...")
-        run_resplat(args, scene_dir, output_dir)
+        run_resplat(args, scene_dir, output_dir, total_frames)
 
     print("\nDone.")
     print(f"Scene:   {scene_dir}")

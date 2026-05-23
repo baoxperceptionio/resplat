@@ -43,5 +43,25 @@ services:
     stdin_open: true
     tty: true
 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: resplat-frontend:latest
+    container_name: resplat-frontend
+    working_dir: /app
+    depends_on:
+      - resplat
+    environment:
+      RESPLAT_REPO: /workspace/resplat
+      FRONTEND_JOB_ROOT: /workspace/resplat/users/webui-jobs
+      RESPLAT_CONTAINER: resplat
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-1}
+    volumes:
+      - .:/workspace/resplat
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${FRONTEND_PORT:-8000}:8000"
+
 volumes:
   resplat-cache:

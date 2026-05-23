@@ -170,6 +170,7 @@ checkpoints*
 metric_checkpoint*
 results*
 tmp*
+users/webui-jobs/
 CLAUDE.md
 .claude
 debug*
