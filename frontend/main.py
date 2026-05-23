@@ -6,14 +6,17 @@ import re
 import threading
 import time
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import docker
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 
 
 REPO_ROOT = Path(os.getenv("RESPLAT_REPO", "/workspace/resplat")).resolve()
@@ -21,7 +24,9 @@ JOB_ROOT = Path(os.getenv("FRONTEND_JOB_ROOT", REPO_ROOT / "users" / "webui-jobs
 RESPLAT_CONTAINER = os.getenv("RESPLAT_CONTAINER", "resplat")
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "1")))
 STATE_PATH = JOB_ROOT / "jobs.json"
+PANORAMA_ROOT = JOB_ROOT / "panorama"
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
 ALLOWED_DOWNLOADS = {"video.mp4", "gaussians.ply"}
 
 MODEL_OPTIONS: list[dict[str, Any]] = [
@@ -123,6 +128,56 @@ def model_public(model: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def perspective_from_equirectangular(
+    image: Image.Image,
+    yaw_center_deg: float,
+    hfov_deg: float,
+    output_width: int,
+    output_height: int,
+) -> Image.Image:
+    pano = np.asarray(image.convert("RGB"), dtype=np.float32)
+    pano_h, pano_w, _ = pano.shape
+
+    hfov = np.deg2rad(hfov_deg)
+    vfov = 2.0 * np.arctan(np.tan(hfov / 2.0) * (output_height / output_width))
+    yaw_center = np.deg2rad(yaw_center_deg)
+
+    xs = (np.arange(output_width, dtype=np.float32) + 0.5) / output_width
+    ys = (np.arange(output_height, dtype=np.float32) + 0.5) / output_height
+    x = (2.0 * xs - 1.0) * np.tan(hfov / 2.0)
+    y = (1.0 - 2.0 * ys) * np.tan(vfov / 2.0)
+    ray_x, ray_y = np.meshgrid(x, y)
+    ray_z = np.ones_like(ray_x)
+
+    norm = np.sqrt(ray_x * ray_x + ray_y * ray_y + ray_z * ray_z)
+    ray_x /= norm
+    ray_y /= norm
+    ray_z /= norm
+
+    lon = np.arctan2(ray_x, ray_z) + yaw_center
+    lat = np.arcsin(np.clip(ray_y, -1.0, 1.0))
+
+    src_x = (lon / (2.0 * np.pi) % 1.0) * pano_w - 0.5
+    src_y = (0.5 - lat / np.pi) * pano_h - 0.5
+    src_y = np.clip(src_y, 0.0, pano_h - 1.0)
+
+    x0 = np.floor(src_x).astype(np.int32) % pano_w
+    x1 = (x0 + 1) % pano_w
+    y0 = np.floor(src_y).astype(np.int32)
+    y1 = np.clip(y0 + 1, 0, pano_h - 1)
+    wx = (src_x - np.floor(src_x))[..., None]
+    wy = (src_y - np.floor(src_y))[..., None]
+
+    top = pano[y0, x0] * (1.0 - wx) + pano[y0, x1] * wx
+    bottom = pano[y1, x0] * (1.0 - wx) + pano[y1, x1] * wx
+    rectified = top * (1.0 - wy) + bottom * wy
+    return Image.fromarray(np.clip(rectified, 0, 255).astype(np.uint8), mode="RGB")
+
+
+def panorama_dir(panorama_id: str) -> Path:
+    return PANORAMA_ROOT / panorama_id
+
+
 def run_resplat_job(job_id: str) -> None:
     with run_semaphore:
         job = update_job(job_id, status="running", started_at=utc_now())
@@ -188,6 +243,7 @@ def run_resplat_job(job_id: str) -> None:
 @app.on_event("startup")
 def prepare_storage() -> None:
     JOB_ROOT.mkdir(parents=True, exist_ok=True)
+    PANORAMA_ROOT.mkdir(parents=True, exist_ok=True)
     with state_lock:
         state = load_state()
         for job in state.get("jobs", {}).values():
@@ -209,6 +265,85 @@ def list_jobs() -> dict[str, Any]:
         jobs = list(load_state()["jobs"].values())
     jobs.sort(key=lambda item: item.get("created_at", ""), reverse=True)
     return {"jobs": [job_public(job) for job in jobs]}
+
+
+@app.post("/api/panorama")
+async def create_panorama(
+    file: UploadFile = File(...),
+    output_width: int = Form(576),
+    output_height: int = Form(1024),
+    hfov_deg: float = Form(60.0),
+    yaw_step_deg: float = Form(20.0),
+) -> dict[str, Any]:
+    filename = safe_slug(file.filename or "panorama.jpg")
+    if Path(filename).suffix.lower() not in IMAGE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Upload a panorama image")
+    if output_width < 128 or output_width > 4096:
+        raise HTTPException(status_code=400, detail="Output width must be 128..4096")
+    if output_height < 128 or output_height > 4096:
+        raise HTTPException(status_code=400, detail="Output height must be 128..4096")
+    if hfov_deg <= 0 or hfov_deg >= 180:
+        raise HTTPException(status_code=400, detail="Horizontal FOV must be between 0 and 180")
+    if yaw_step_deg <= 0 or yaw_step_deg > 180:
+        raise HTTPException(status_code=400, detail="Yaw step must be between 0 and 180")
+
+    panorama_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    root = panorama_dir(panorama_id)
+    outputs = root / "rectified"
+    root.mkdir(parents=True, exist_ok=True)
+    outputs.mkdir(parents=True, exist_ok=True)
+    source_path = root / filename
+    with source_path.open("wb") as handle:
+        while chunk := await file.read(1024 * 1024):
+            handle.write(chunk)
+
+    try:
+        image = Image.open(source_path)
+        image.load()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read image: {exc}") from exc
+
+    starts = [float(value) for value in np.arange(0.0, 360.0, yaw_step_deg)]
+    files = []
+    for index, start_deg in enumerate(starts):
+        end_deg = start_deg + hfov_deg
+        yaw_center = start_deg + hfov_deg / 2.0
+        rectified = perspective_from_equirectangular(
+            image,
+            yaw_center,
+            hfov_deg,
+            output_width,
+            output_height,
+        )
+        name = f"{index:03d}_yaw_{int(round(start_deg)):03d}_{int(round(end_deg)):03d}.jpg"
+        out_path = outputs / name
+        rectified.save(out_path, quality=95, subsampling=1)
+        files.append(
+            {
+                "name": name,
+                "start_deg": start_deg,
+                "end_deg": end_deg,
+                "url": f"/api/panorama/{panorama_id}/files/{name}",
+            }
+        )
+
+    zip_path = root / "rectified.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for item in files:
+            archive.write(outputs / item["name"], item["name"])
+
+    return {
+        "panorama": {
+            "id": panorama_id,
+            "source": filename,
+            "source_size": {"width": image.width, "height": image.height},
+            "output_size": {"width": output_width, "height": output_height},
+            "hfov_deg": hfov_deg,
+            "yaw_step_deg": yaw_step_deg,
+            "files": files,
+            "zip": f"/api/panorama/{panorama_id}/rectified.zip",
+        }
+    }
 
 
 @app.post("/api/jobs")
@@ -322,6 +457,25 @@ def get_file(job_id: str, filename: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="File not ready")
     media_type = "video/mp4" if filename == "video.mp4" else "application/octet-stream"
     return FileResponse(path, media_type=media_type, filename=filename)
+
+
+@app.get("/api/panorama/{panorama_id}/files/{filename}")
+def get_panorama_file(panorama_id: str, filename: str) -> FileResponse:
+    safe_name = safe_slug(filename)
+    if safe_name != filename or Path(filename).suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+        raise HTTPException(status_code=404, detail="File not found")
+    path = panorama_dir(panorama_id) / "rectified" / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path, media_type="image/jpeg", filename=filename)
+
+
+@app.get("/api/panorama/{panorama_id}/rectified.zip")
+def get_panorama_zip(panorama_id: str) -> FileResponse:
+    path = panorama_dir(panorama_id) / "rectified.zip"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path, media_type="application/zip", filename="rectified.zip")
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
