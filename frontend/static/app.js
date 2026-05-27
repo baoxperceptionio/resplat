@@ -63,6 +63,7 @@ let activeJobId = null;
 let activeColmapJobId = null;
 let viewer = null;
 let loadedPlyUrl = null;
+let activeColmapRenderKey = null;
 let activeTab = "colmap";
 let activePanoramaId = null;
 let autoSelectJob = true;
@@ -550,8 +551,10 @@ async function refreshColmapJobs() {
   colmapJobs = data.jobs ?? [];
   if (!activeColmapJobId && colmapJobs.length > 0) {
     activeColmapJobId = colmapJobs[0].id;
+    activeColmapRenderKey = null;
   } else if (previousActive && !colmapJobs.some((job) => job.id === previousActive)) {
     activeColmapJobId = colmapJobs[0]?.id ?? null;
+    activeColmapRenderKey = null;
   }
   renderColmapJobs();
   await loadColmapDatasets();
@@ -570,8 +573,25 @@ async function selectJob(jobId) {
 
 async function selectColmapJob(jobId) {
   activeColmapJobId = jobId;
+  activeColmapRenderKey = null;
   renderColmapJobs();
   await refreshActiveColmapJob();
+}
+
+function colmapRenderKey(job) {
+  return JSON.stringify({
+    id: job.id,
+    status: job.status,
+    selected: job.selected_candidate_id ?? null,
+    overview: job.overview_url ?? null,
+    candidates: (job.candidates ?? []).map((candidate) => [
+      candidate.id,
+      candidate.image_url,
+      candidate.inliers,
+      candidate.inlier_ratio,
+      candidate.rms_distance,
+    ]),
+  });
 }
 
 async function refreshActiveJob() {
@@ -617,7 +637,7 @@ function renderCandidates(job) {
     const overview = document.createElement("div");
     overview.className = "candidate-card";
     overview.innerHTML = `
-      <img src="${job.overview_url}?t=${Date.now()}" alt="overview" loading="lazy" />
+      <img src="${job.overview_url}" alt="overview" loading="lazy" />
       <div class="job-meta">overview</div>
     `;
     candidateGallery.appendChild(overview);
@@ -634,7 +654,7 @@ function renderCandidates(job) {
     const ratio = Number(candidate.inlier_ratio ?? 0).toFixed(3);
     const rms = Number(candidate.rms_distance ?? 0).toFixed(4);
     card.innerHTML = `
-      <img src="${candidate.image_url}?t=${Date.now()}" alt="candidate ${candidate.id}" loading="lazy" />
+      <img src="${candidate.image_url}" alt="candidate ${candidate.id}" loading="lazy" />
       <div class="job-top">
         <div class="job-id">candidate ${candidate.id}</div>
         <span class="status ${candidate.id === job.selected_candidate_id ? "succeeded" : "queued"}">${candidate.id === job.selected_candidate_id ? "已保存" : "候选"}</span>
@@ -659,12 +679,17 @@ async function refreshActiveColmapJob() {
     colmapMeta.textContent = "等待 COLMAP 任务";
     candidateGallery.innerHTML = '<div class="empty-inline">等待 COLMAP 任务</div>';
     colmapLogs.textContent = "";
+    activeColmapRenderKey = null;
     return;
   }
 
   colmapTitle.textContent = job.id;
   colmapMeta.textContent = `${statusText[job.status] ?? job.status} · ${job.frame_count ?? 0} images · ${job.proposal_count ?? job.candidates?.length ?? 0} candidates`;
-  renderCandidates(job);
+  const nextRenderKey = colmapRenderKey(job);
+  if (nextRenderKey !== activeColmapRenderKey) {
+    renderCandidates(job);
+    activeColmapRenderKey = nextRenderKey;
+  }
 
   const logsResponse = await fetch(`/api/colmap-jobs/${job.id}/logs`, { cache: "no-store" });
   colmapLogs.textContent = await logsResponse.text();
