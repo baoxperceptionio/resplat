@@ -223,7 +223,7 @@ def write_merged_ply(merged: dict[str, torch.Tensor], output_path: Path) -> None
     )
 
 
-def write_rendered_video(rendered: torch.Tensor, output_path: Path, fps: float = 12.0) -> None:
+def write_rendered_video(rendered: torch.Tensor, output_path: Path, fps: float = 30.0) -> None:
     import imageio
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -287,7 +287,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--batch_overlap", type=int, default=None)
     parser.add_argument("--render_chunk_size", type=int, default=2)
-    parser.add_argument("--video_fps", type=float, default=12.0)
+    parser.add_argument("--video_fps", type=float, default=30.0)
     parser.add_argument("--near", type=float, default=0.01)
     parser.add_argument("--far", type=float, default=200.0)
     parser.add_argument("--images_dir", default="images")

@@ -34,19 +34,52 @@ def export_ply(
     path: Path,
     align_to_view: bool = True,  # whether to align world space to the view space (camera space) of the extrinsics
     save_gaussian_npz: bool = False,
+    covariances: Float[Tensor, "gaussian 3 3"] | None = None,
 ):
+    def scales_and_rotations_from_covariances(
+        covariances: Float[Tensor, "gaussian 3 3"],
+        view_rotation: Float[Tensor, "3 3"] | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        covariances = covariances.detach().float().cpu()
+        if view_rotation is not None:
+            view_rotation = view_rotation.detach().float().cpu()
+            covariances = view_rotation @ covariances @ view_rotation.transpose(-1, -2)
+
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariances)
+        scales = eigenvalues.clamp_min(1e-12).sqrt().numpy()
+
+        # Eigenvectors are columns of the rotation matrix. Flip one axis for any
+        # left-handed basis; the covariance is unchanged by this sign flip.
+        left_handed = torch.linalg.det(eigenvectors) < 0
+        eigenvectors[left_handed, :, 0] *= -1
+
+        rotations_xyzw = R.from_matrix(eigenvectors.numpy()).as_quat()
+        x, y, z, w = np.moveaxis(rotations_xyzw, -1, 0)
+        rotations_wxyz = np.stack((w, x, y, z), axis=-1).astype(np.float32)
+        return scales.astype(np.float32), rotations_wxyz
+
+    view_rotation = None
     if align_to_view:
         view_rotation = extrinsics[:3, :3].inverse()
         # Apply the rotation to the means (Gaussian positions).
         means = einsum(view_rotation, means, "i j, ... j -> ... i")
 
+    if covariances is not None:
+        scales, rotations = scales_and_rotations_from_covariances(
+            covariances,
+            view_rotation,
+        )
+
+    elif align_to_view:
         # Apply the rotation to the Gaussian rotations.
         rotations = R.from_quat(rotations.detach().cpu().numpy()).as_matrix()
         rotations = view_rotation.detach().cpu().numpy() @ rotations
         rotations = R.from_matrix(rotations).as_quat()
         x, y, z, w = rearrange(rotations, "g xyzw -> xyzw g")
         rotations = np.stack((w, x, y, z), axis=-1)
+        scales = scales.detach().cpu().numpy()
     else:
+        scales = scales.detach().cpu().numpy()
         rotations = rotations.detach().cpu().numpy()
 
     num_rest = 3 * (harmonics.shape[-1] - 1)
@@ -59,7 +92,7 @@ def export_ply(
         harmonics[..., 0].detach().cpu().contiguous().numpy(),
         harmonics[..., 1:].flatten(start_dim=1).detach().cpu().contiguous().numpy(),
         torch.logit(opacities[..., None]).detach().cpu().numpy(),
-        scales.log().detach().cpu().numpy(),
+        np.log(scales),
         rotations,
     )
 
@@ -128,6 +161,7 @@ def save_gaussian_ply(gaussians, visualization_dump, example, save_path,
             save_path,
             align_to_view=not no_align_to_view,
             save_gaussian_npz=save_gaussian_npz,
+            covariances=gaussians.covariances[0] if gaussians.covariances is not None else None,
         )
     else:
         world_rotations = trim(gaussians.rotations)[0]
@@ -143,6 +177,5 @@ def save_gaussian_ply(gaussians, visualization_dump, example, save_path,
             save_path,
             align_to_view=not no_align_to_view,
             save_gaussian_npz=save_gaussian_npz,
+            covariances=trim(gaussians.covariances)[0] if gaussians.covariances is not None else None,
         )
-
-

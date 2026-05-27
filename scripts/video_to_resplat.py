@@ -390,6 +390,8 @@ def run_resplat(
         "--render_chunk_size",
         str(args.render_chunk_size),
         "--smooth_video_fps",
+        f"{args.output_video_fps:g}",
+        "--smooth_video_source_fps",
         f"{args.sample_fps:g}",
         "--no_eval",
     ]
@@ -437,6 +439,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_SAMPLE_FPS,
         help="Frames per second to sample from each video when --num_frames is omitted.",
+    )
+    parser.add_argument(
+        "--output_video_fps",
+        type=float,
+        default=30.0,
+        help="FPS for the rendered MP4 output.",
     )
     parser.add_argument(
         "--work_dir",
@@ -547,6 +555,8 @@ def main() -> None:
 
     if args.num_frames is None and args.sample_fps <= 0:
         raise ValueError("--sample_fps must be positive")
+    if args.output_video_fps <= 0:
+        raise ValueError("--output_video_fps must be positive")
 
     default_suffix = (
         f"N{args.num_frames}"

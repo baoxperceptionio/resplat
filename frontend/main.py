@@ -31,6 +31,7 @@ JOB_ROOT = Path(os.getenv("FRONTEND_JOB_ROOT", REPO_ROOT / "users" / "webui-jobs
 UPLOAD_ROOT = JOB_ROOT / "uploads"
 RESPLAT_CONTAINER = os.getenv("RESPLAT_CONTAINER", "resplat")
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "1")))
+OUTPUT_VIDEO_FPS = float(os.getenv("RESPLAT_OUTPUT_VIDEO_FPS", "30"))
 STATE_PATH = JOB_ROOT / "jobs.json"
 PANORAMA_ROOT = JOB_ROOT / "panorama"
 SEEDANCE_START_URL = "https://video.a2e.ai/api/v1/seedance2Video/start"
@@ -588,6 +589,7 @@ def job_public(job: dict[str, Any]) -> dict[str, Any]:
     ply_path = result_dir / "gaussians.ply"
     preview_ply_path = result_dir / "gaussians_preview.ply"
     enriched = dict(job)
+    enriched.setdefault("output_video_fps", OUTPUT_VIDEO_FPS)
     manifest_path = result_dir / "batch_manifest.json"
     video_version = None
     ply_version = None
@@ -1005,7 +1007,7 @@ def run_resplat_job(job_id: str) -> None:
         if job.get("source_type") == "colmap":
             dataset = job["colmap_dataset"]
             frame_count = max(1, int(dataset.get("frame_count") or 1))
-            smooth_video_fps = float(job.get("sample_fps") or dataset.get("sample_fps") or 30)
+            source_video_fps = float(job.get("sample_fps") or dataset.get("sample_fps") or OUTPUT_VIDEO_FPS)
             if job.get("resplat_mode") == "batch_merge":
                 command = [
                     "python",
@@ -1027,7 +1029,7 @@ def run_resplat_job(job_id: str) -> None:
                     "--render_chunk_size",
                     str(job["render_chunk_size"]),
                     "--video_fps",
-                    f"{smooth_video_fps:g}",
+                    f"{OUTPUT_VIDEO_FPS:g}",
                 ]
             else:
                 command = [
@@ -1055,7 +1057,9 @@ def run_resplat_job(job_id: str) -> None:
                     "--render_chunk_size",
                     str(job["render_chunk_size"]),
                     "--smooth_video_fps",
-                    f"{smooth_video_fps:g}",
+                    f"{OUTPUT_VIDEO_FPS:g}",
+                    "--smooth_video_source_fps",
+                    f"{source_video_fps:g}",
                     "--no_eval",
                 ]
                 if frame_count < int(model["views"]):
@@ -1944,6 +1948,7 @@ async def create_job(request: Request) -> dict[str, Any]:
         "batch_count": batch_count if resplat_mode == "batch_merge" else None,
         "batch_manifest": None,
         "sample_fps": colmap_dataset.get("sample_fps") if colmap_dataset else sample_fps,
+        "output_video_fps": OUTPUT_VIDEO_FPS,
         "render_chunk_size": render_chunk_size,
         "start_time": start_time,
         "end_time": end_time,

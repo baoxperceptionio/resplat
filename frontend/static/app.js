@@ -384,8 +384,9 @@ function jobSourceMeta(job) {
       ? ` · ${job.batch_count} batches`
       : "";
     const fps = dataset?.sample_fps ?? job.sample_fps;
-    const fpsText = fps ? ` · ${fps} FPS` : "";
-    return `COLMAP · ${mode} · ${dataset?.frame_count ?? 0} images${fpsText}${batches}`;
+    const fpsText = fps ? ` · 抽帧 ${fps} FPS` : "";
+    const outputFpsText = job.output_video_fps ? ` · 输出 ${job.output_video_fps} FPS` : "";
+    return `COLMAP · ${mode} · ${dataset?.frame_count ?? 0} images${fpsText}${outputFpsText}${batches}`;
   }
   return `${job.sample_fps} FPS · ${jobUploadCount(job)} video`;
 }

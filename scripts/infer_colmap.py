@@ -954,6 +954,7 @@ def save_outputs(
                 gaussians.opacities[0],
                 ply_path,
                 align_to_view=True,
+                covariances=gaussians.covariances[0] if gaussians.covariances is not None else None,
             )
             print(f"Saved Gaussian PLY to {ply_path}")
         except Exception as e:
@@ -965,11 +966,39 @@ def save_outputs(
 # =============================================================================
 
 
+def resample_camera_path(c2w, source_fps, target_fps):
+    """Upsample a camera path so low-FPS source trajectories can render smooth videos."""
+    if (
+        source_fps is None
+        or source_fps <= 0
+        or target_fps <= source_fps
+        or len(c2w) < 2
+    ):
+        return c2w
+
+    from scipy.spatial.transform import Rotation, Slerp
+
+    target_count = max(len(c2w), int(round(len(c2w) * target_fps / source_fps)))
+    if target_count <= len(c2w):
+        return c2w
+
+    key_times = np.linspace(0.0, (len(c2w) - 1) / source_fps, len(c2w))
+    target_times = np.linspace(0.0, key_times[-1], target_count)
+
+    rotations = Rotation.from_matrix(c2w[:, :3, :3])
+    slerp = Slerp(key_times, rotations)
+    resampled = np.tile(np.eye(4, dtype=np.float32), (target_count, 1, 1))
+    resampled[:, :3, :3] = slerp(target_times).as_matrix().astype(np.float32)
+    for axis in range(3):
+        resampled[:, axis, 3] = np.interp(target_times, key_times, c2w[:, axis, 3])
+    return resampled
+
+
 @torch.no_grad()
 def render_smooth_video(
     gaussians, decoder, all_c2w_np, context_c2w, intrinsic_np,
     near, far, image_shape, output_dir,
-    render_chunk_size=10, fps=30.0, smooth_kernel=45,
+    render_chunk_size=10, fps=30.0, smooth_kernel=45, source_fps=None,
     device="cuda",
 ):
     """Render a smooth video by smoothing all scene poses and rendering each frame.
@@ -986,23 +1015,32 @@ def render_smooth_video(
         render_chunk_size: number of views to render at once
         fps: video frame rate
         smooth_kernel: Gaussian kernel size for trajectory smoothing
+        source_fps: FPS of the source camera poses. When lower than fps, the
+            smoothed path is interpolated before rendering.
         device: torch device
     """
     import imageio
 
-    N = len(all_c2w_np)
+    source_N = len(all_c2w_np)
     h, w = image_shape
-    print(f"Rendering smooth video with {N} frames (kernel={smooth_kernel})...")
+    print(f"Rendering smooth video from {source_N} source frames (kernel={smooth_kernel})...")
 
     # 1. Smooth the trajectory
     poses_3x4 = all_c2w_np[:, :3, :]  # [N, 3, 4]
     smoothed_list = render_stabilization_path(poses_3x4, k_size=smooth_kernel)
 
     # Reconstruct [N, 4, 4] from smoothed [3, 4] matrices
-    smoothed_c2w = np.zeros((N, 4, 4), dtype=np.float32)
+    smoothed_c2w = np.zeros((source_N, 4, 4), dtype=np.float32)
     for i, pose in enumerate(smoothed_list):
         smoothed_c2w[i, :3, :] = pose
         smoothed_c2w[i, 3, 3] = 1.0
+
+    smoothed_c2w = resample_camera_path(smoothed_c2w, source_fps, fps)
+    N = len(smoothed_c2w)
+    if N != source_N:
+        print(f"  Upsampled trajectory: {source_N} -> {N} frames ({source_fps:g} fps source, {fps:g} fps output)")
+    else:
+        print(f"  Rendering {N} frames at {fps:g} fps")
 
     # 2. Normalize poses using the same pivot as build_batch()
     smoothed_c2w_t = torch.tensor(smoothed_c2w, dtype=torch.float32)
@@ -1295,9 +1333,15 @@ def parse_args():
     )
     parser.add_argument(
         "--smooth_video_fps",
-        type=int,
-        default=30,
+        type=float,
+        default=30.0,
         help="FPS for smooth video output",
+    )
+    parser.add_argument(
+        "--smooth_video_source_fps",
+        type=float,
+        default=None,
+        help="FPS of source camera poses. If lower than --smooth_video_fps, interpolate the video path.",
     )
     parser.add_argument(
         "--max_save_images",
@@ -1492,6 +1536,7 @@ def run_scene(args, scene_path, scene_name, output_dir,
             render_chunk_size=args.render_chunk_size,
             fps=args.smooth_video_fps,
             smooth_kernel=args.smooth_video_kernel,
+            source_fps=args.smooth_video_source_fps,
             device=args.device,
         )
 
@@ -1593,6 +1638,10 @@ def main():
         raise ValueError("--start_frame requires --frame_distance.")
     if args.frame_distance is not None and args.start_frame is None:
         args.start_frame = 0
+    if args.smooth_video_fps <= 0:
+        raise ValueError("--smooth_video_fps must be positive.")
+    if args.smooth_video_source_fps is not None and args.smooth_video_source_fps <= 0:
+        raise ValueError("--smooth_video_source_fps must be positive.")
 
     # Resolve sparse_dir/images_dir defaults based on mode
     if args.sparse_dir is None:
