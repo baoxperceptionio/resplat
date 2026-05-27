@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>ReSplat</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=20260523-uploadfix2" />
     <script type="importmap">
       {
         "imports": {
@@ -15,7 +15,7 @@
       }
     </script>
   </head>
-  <body>
+  <body data-tool="pipeline">
     <main class="app-shell">
       <aside class="sidebar">
         <div class="brand">
@@ -23,49 +23,144 @@
           <span id="serviceState">ready</span>
         </div>
 
-        <form id="jobForm" class="panel">
-          <label>
-            <span>视频</span>
-            <input id="files" name="files" type="file" accept=".mp4,.mov,.m4v,video/*" multiple required />
-          </label>
+        <nav class="tabs" aria-label="tools">
+          <a class="tab-button active" href="/?tool=pipeline" data-tab="pipeline" aria-selected="true">视频 pipeline</a>
+          <a class="tab-button" href="/?tool=panorama" data-tab="panorama" aria-selected="false">全景切图</a>
+        </nav>
 
-          <label>
-            <span>模型</span>
-            <select id="model" name="model_id" required></select>
-          </label>
-
-          <div class="control-grid">
+        <div class="tab-panel active" data-panel="pipeline">
+          <form id="jobForm" class="panel">
             <label>
-              <span>抽帧 FPS</span>
-              <input id="sampleFps" name="sample_fps" type="number" min="0.1" max="60" step="0.1" value="4" required />
+              <span>视频</span>
+              <input id="files" name="files" type="file" accept=".mp4,.mov,.m4v,.avi,.mkv,.webm,.mpeg,.mpg,.mts,.m2ts,video/*" multiple required />
             </label>
-            <label>
-              <span>渲染批量</span>
-              <input id="chunkSize" name="render_chunk_size" type="number" min="1" max="32" step="1" value="2" required />
-            </label>
-          </div>
 
-          <div class="control-grid">
             <label>
-              <span>开始秒</span>
-              <input id="startTime" name="start_time" type="number" min="0" step="0.1" placeholder="0" />
+              <span>模型</span>
+              <select id="model" name="model_id" required></select>
             </label>
+
+            <div class="control-grid">
+              <label>
+                <span>抽帧 FPS</span>
+                <input id="sampleFps" name="sample_fps" type="number" min="0.1" max="60" step="0.1" value="4" required />
+              </label>
+              <label>
+                <span>渲染批量</span>
+                <input id="chunkSize" name="render_chunk_size" type="number" min="1" max="32" step="1" value="2" required />
+              </label>
+            </div>
+
+            <div class="control-grid">
+              <label>
+                <span>开始秒</span>
+                <input id="startTime" name="start_time" type="number" min="0" step="0.1" placeholder="0" />
+              </label>
+              <label>
+                <span>结束秒</span>
+                <input id="endTime" name="end_time" type="number" min="0" step="0.1" placeholder="自动" />
+              </label>
+            </div>
+
+            <button id="submitButton" type="submit">启动 pipeline</button>
+          </form>
+
+          <section class="jobs-section">
+            <div class="section-head">
+              <h2>任务</h2>
+              <button id="refreshJobs" class="icon-button" type="button" title="刷新">↻</button>
+            </div>
+            <div id="jobs" class="jobs"></div>
+          </section>
+        </div>
+
+        <div class="tab-panel" data-panel="panorama" hidden>
+          <form id="panoramaForm" class="panel">
             <label>
-              <span>结束秒</span>
-              <input id="endTime" name="end_time" type="number" min="0" step="0.1" placeholder="自动" />
+              <span>全景图</span>
+              <input id="panoramaFile" name="file" type="file" accept=".jpg,.jpeg,.png,.webp,.tif,.tiff,image/*" required />
             </label>
-          </div>
 
-          <button id="submitButton" type="submit">启动 pipeline</button>
-        </form>
+            <div class="control-grid">
+              <label>
+                <span>输出宽</span>
+                <input name="output_width" type="number" min="128" max="4096" step="1" value="1920" required />
+              </label>
+              <label>
+                <span>输出高</span>
+                <input name="output_height" type="number" min="128" max="4096" step="1" value="1080" required />
+              </label>
+            </div>
 
-        <section class="jobs-section">
-          <div class="section-head">
-            <h2>任务</h2>
-            <button id="refreshJobs" class="icon-button" type="button" title="刷新">↻</button>
-          </div>
-          <div id="jobs" class="jobs"></div>
-        </section>
+            <div class="control-grid">
+              <label>
+                <span>水平视角</span>
+                <input name="hfov_deg" type="number" min="1" max="179" step="1" value="60" required />
+              </label>
+              <label>
+                <span>起点步长</span>
+                <input name="yaw_step_deg" type="number" min="1" max="180" step="1" value="20" required />
+              </label>
+            </div>
+
+            <button id="panoramaButton" type="submit">生成 rectified 图片</button>
+          </form>
+
+          <form id="seedanceForm" class="panel" hidden>
+            <label>
+              <span>Seedance Token</span>
+              <input name="token" type="password" autocomplete="off" required />
+            </label>
+
+            <label>
+              <span>提示词</span>
+              <textarea name="prompt" rows="3" required>相机视角平移前进5米</textarea>
+            </label>
+
+            <div class="control-grid">
+              <label>
+                <span>模型</span>
+                <select name="model_version">
+                  <option value="standard">standard</option>
+                  <option value="fast">fast</option>
+                </select>
+              </label>
+              <label>
+                <span>时长</span>
+                <input name="duration" type="number" min="1" max="30" step="1" value="5" />
+              </label>
+            </div>
+
+            <div class="control-grid">
+              <label>
+                <span>分辨率</span>
+                <select name="resolution">
+                  <option value="720p">720p</option>
+                  <option value="480p">480p</option>
+                  <option value="1080p">1080p</option>
+                </select>
+              </label>
+              <label>
+                <span>画幅</span>
+                <select name="aspect_ratio">
+                  <option value="16:9">16:9</option>
+                  <option value="21:9">21:9</option>
+                  <option value="4:3">4:3</option>
+                  <option value="1:1">1:1</option>
+                  <option value="9:16">9:16</option>
+                </select>
+              </label>
+            </div>
+
+            <label class="check-row">
+              <input name="generate_audio" type="checkbox" checked />
+              <span>生成音频</span>
+            </label>
+
+            <button id="seedanceButton" type="submit">对 rectified 图片运行 Seedance</button>
+            <pre id="seedanceStatus" class="mini-log"></pre>
+          </form>
+        </div>
       </aside>
 
       <section class="workspace">
@@ -75,23 +170,41 @@
             <span id="activeMeta">上传视频后会在这里显示产物</span>
           </div>
           <div class="actions">
+            <button id="toggleOutputPane" class="button ghost" type="button">展开 3DGS</button>
             <a id="downloadVideo" class="button ghost disabled" href="#" download>下载 video.mp4</a>
             <a id="downloadPly" class="button ghost disabled" href="#" download>下载 gaussians.ply</a>
           </div>
         </div>
 
-        <div class="viewer-wrap">
-          <div id="viewer"></div>
-          <div id="viewerEmpty" class="empty-state">3DGS viewer</div>
+        <div id="pipelineWorkspace" class="workspace-view active" style="--output-height: 180px;">
+          <div class="viewer-wrap">
+            <div id="viewer"></div>
+            <div id="viewerEmpty" class="empty-state">3DGS viewer</div>
+            <div id="viewerResize" class="viewer-resize-grip" title="拖拽调整 3DGS viewer 高度"></div>
+          </div>
+
+          <div class="output-pane">
+            <video id="videoPreview" controls playsinline></video>
+            <div id="outputResize" class="resize-handle col-resize" title="拖拽调整 video/log 宽度"></div>
+            <pre id="logs"></pre>
+          </div>
         </div>
 
-        <div class="output-pane">
-          <video id="videoPreview" controls playsinline></video>
-          <pre id="logs"></pre>
+        <div id="panoramaWorkspace" class="workspace-view panorama-view" hidden>
+          <div class="panorama-actions">
+            <div>
+              <p id="panoramaTitle">全景切图</p>
+              <span id="panoramaMeta">上传 equirectangular 全景图后生成 rectified views</span>
+            </div>
+            <a id="downloadPanoramaZip" class="button ghost disabled" href="#" download>下载 ZIP</a>
+          </div>
+          <div id="panoramaGallery" class="panorama-gallery">
+            <div class="empty-inline">等待全景图</div>
+          </div>
         </div>
       </section>
     </main>
 
-    <script type="module" src="/app.js"></script>
+    <script type="module" src="/app.js?v=20260523-uploadfix2"></script>
   </body>
 </html>

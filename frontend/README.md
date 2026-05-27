@@ -20,3 +20,9 @@ Each job runs inside the existing `resplat` container through Docker's socket. T
 - `gaussians.ply`
 
 The in-browser 3DGS viewer uses SparkJS `2.1.0` with Three.js `0.180.0`.
+After clicking the viewer, `W/A/S/D` translates across the ground plane, `Q/E`
+translates vertically, and `R` restores the framed view.
+
+The panorama tab converts an equirectangular panorama into rectified perspective
+views. Defaults are 1920x1080 output images, 60 degree horizontal FOV, and 20
+degree yaw-start steps, producing views from `000-060` through `340-400`.

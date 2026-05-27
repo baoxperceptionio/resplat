@@ -83,6 +83,9 @@ Check [scripts/infer_colmap.sh](scripts/infer_colmap.sh) for running our pre-tra
 
 A demo scene can be downloaded [here](https://huggingface.co/datasets/haofeixu/depthsplat/resolve/main/dl3dv-colmap-demo.zip) to quickly try our method.
 
+For long videos where COLMAP needs more frames than ReSplat should consume, see
+[Video to ReSplat with 32 Uniform Context Views](docs/video_colmap_uniform32_workflow.md).
+
 
 ## Evaluation
 

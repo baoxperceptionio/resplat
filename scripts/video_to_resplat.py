@@ -13,7 +13,18 @@ import subprocess
 from pathlib import Path
 
 
-VIDEO_EXTENSIONS = {".mp4", ".mov"}
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".m4v",
+    ".avi",
+    ".mkv",
+    ".webm",
+    ".mpeg",
+    ".mpg",
+    ".mts",
+    ".m2ts",
+}
 DEFAULT_SAMPLE_FPS = 4.0
 
 PRESET_SHAPES = {
@@ -115,7 +126,7 @@ def video_duration_seconds(video: Path) -> float:
 def video_paths(input_path: Path) -> list[Path]:
     if input_path.is_file():
         if input_path.suffix.lower() not in VIDEO_EXTENSIONS:
-            raise ValueError(f"Input file is not an MP4/MOV video: {input_path}")
+            raise ValueError(f"Input file is not a supported video: {input_path}")
         return [input_path]
 
     if input_path.is_dir():
@@ -125,7 +136,7 @@ def video_paths(input_path: Path) -> list[Path]:
             if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
         )
         if not videos:
-            raise FileNotFoundError(f"No MP4/MOV videos found under {input_path}")
+            raise FileNotFoundError(f"No supported videos found under {input_path}")
         return videos
 
     raise FileNotFoundError(input_path)
@@ -359,7 +370,7 @@ def run_resplat(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Extract frames from one video or a folder of MP4/MOV videos, "
+            "Extract frames from one video or a folder of supported videos, "
             "reconstruct cameras with COLMAP, and run ReSplat."
         )
     )
@@ -367,7 +378,7 @@ def parse_args() -> argparse.Namespace:
         "--video",
         required=True,
         type=Path,
-        help="Input video path, or a folder containing MP4/MOV videos from one scene",
+        help="Input video path, or a folder containing videos from one scene",
     )
     parser.add_argument(
         "-N",
