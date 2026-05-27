@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import re
 import shlex
 import shutil
+import struct
+import subprocess
 import threading
 import time
 import uuid
@@ -43,8 +47,42 @@ VIDEO_EXTENSIONS = {
     ".m2ts",
 }
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
-ALLOWED_DOWNLOADS = {"video.mp4", "gaussians.ply"}
+ALLOWED_DOWNLOADS = {"video.mp4", "gaussians.ply", "gaussians_preview.ply"}
 COLMAP_ALLOWED_FILES = {"overview_zy.png"}
+COLMAP_GROUND_RANSAC_THRESHOLD = 0.05
+PLY_VIEWER_PREVIEW_MAX_BYTES = 300 * 1024 * 1024
+PLY_VIEWER_PREVIEW_MAX_VERTICES = 512_000
+PLY_TYPE_SIZES = {
+    "char": 1,
+    "uchar": 1,
+    "int8": 1,
+    "uint8": 1,
+    "short": 2,
+    "ushort": 2,
+    "int16": 2,
+    "uint16": 2,
+    "int": 4,
+    "uint": 4,
+    "int32": 4,
+    "uint32": 4,
+    "float": 4,
+    "float32": 4,
+    "double": 8,
+    "float64": 8,
+}
+CAMERA_MODEL_PARAMS = {
+    0: ("SIMPLE_PINHOLE", 3),
+    1: ("PINHOLE", 4),
+    2: ("SIMPLE_RADIAL", 4),
+    3: ("RADIAL", 5),
+    4: ("OPENCV", 8),
+    5: ("OPENCV_FISHEYE", 8),
+    6: ("FULL_OPENCV", 12),
+    7: ("FOV", 5),
+    8: ("SIMPLE_RADIAL_FISHEYE", 4),
+    9: ("RADIAL_FISHEYE", 5),
+    10: ("THIN_PRISM_FISHEYE", 12),
+}
 
 PRESET_SHAPES = {
     "dl3dv_8v_512x960": (512, 960),
@@ -84,9 +122,229 @@ MODEL_OPTIONS: list[dict[str, Any]] = [
 ]
 MODELS_BY_ID = {model["id"]: model for model in MODEL_OPTIONS}
 
+
+def plan_batch_count(frame_count: int, batch_size: int, batch_overlap: int) -> int:
+    frame_count = max(0, int(frame_count))
+    batch_size = max(1, int(batch_size))
+    batch_overlap = max(0, int(batch_overlap))
+    if frame_count <= batch_size:
+        return 1
+    stride = max(1, batch_size - min(batch_overlap, batch_size - 1))
+    starts = list(range(0, frame_count - batch_size + 1, stride))
+    final_start = frame_count - batch_size
+    if starts[-1] != final_start:
+        starts.append(final_start)
+    return len(set(starts))
+
+
+def dataset_ground_alignment_path(dataset: dict[str, Any]) -> Path:
+    return Path(dataset["scene"]) / "ground_alignment.json"
+
+
+def resolve_stored_path(value: str | Path) -> Path:
+    path = Path(value)
+    if path.exists():
+        return path
+    workspace_root = Path("/workspace/resplat")
+    try:
+        relative = path.relative_to(workspace_root)
+    except ValueError:
+        return path
+    candidate = REPO_ROOT / relative
+    return candidate if candidate.exists() else path
+
+
+def read_colmap_bytes(fid, num_bytes: int, format_char_sequence: str) -> tuple[Any, ...]:
+    data = fid.read(num_bytes)
+    if len(data) != num_bytes:
+        raise EOFError("Unexpected end of COLMAP binary file")
+    return struct.unpack("<" + format_char_sequence, data)
+
+
+def qvec_to_rotmat(qvec: np.ndarray) -> np.ndarray:
+    return np.array(
+        [
+            [
+                1 - 2 * qvec[2] ** 2 - 2 * qvec[3] ** 2,
+                2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
+                2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2],
+            ],
+            [
+                2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
+                1 - 2 * qvec[1] ** 2 - 2 * qvec[3] ** 2,
+                2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1],
+            ],
+            [
+                2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
+                2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
+                1 - 2 * qvec[1] ** 2 - 2 * qvec[2] ** 2,
+            ],
+        ],
+        dtype=np.float32,
+    )
+
+
+def read_colmap_cameras(sparse_path: Path) -> dict[int, dict[str, Any]]:
+    cameras_bin = sparse_path / "cameras.bin"
+    cameras_txt = sparse_path / "cameras.txt"
+    cameras: dict[int, dict[str, Any]] = {}
+    if cameras_bin.exists():
+        with cameras_bin.open("rb") as fid:
+            num_cameras = read_colmap_bytes(fid, 8, "Q")[0]
+            for _ in range(num_cameras):
+                camera_id, model_id, width, height = read_colmap_bytes(fid, 24, "iiQQ")
+                model_name, num_params = CAMERA_MODEL_PARAMS[int(model_id)]
+                params = read_colmap_bytes(fid, 8 * num_params, "d" * num_params)
+                cameras[int(camera_id)] = {
+                    "model": model_name,
+                    "width": int(width),
+                    "height": int(height),
+                    "params": np.array(params, dtype=np.float64),
+                }
+        return cameras
+    if cameras_txt.exists():
+        for line in cameras_txt.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            cameras[int(parts[0])] = {
+                "model": parts[1],
+                "width": int(parts[2]),
+                "height": int(parts[3]),
+                "params": np.array([float(item) for item in parts[4:]], dtype=np.float64),
+            }
+    return cameras
+
+
+def read_colmap_images(sparse_path: Path) -> list[dict[str, Any]]:
+    images_bin = sparse_path / "images.bin"
+    images_txt = sparse_path / "images.txt"
+    images: list[dict[str, Any]] = []
+    if images_bin.exists():
+        with images_bin.open("rb") as fid:
+            num_images = read_colmap_bytes(fid, 8, "Q")[0]
+            for _ in range(num_images):
+                props = read_colmap_bytes(fid, 64, "idddddddi")
+                name_bytes = bytearray()
+                while True:
+                    char = read_colmap_bytes(fid, 1, "c")[0]
+                    if char == b"\x00":
+                        break
+                    name_bytes.extend(char)
+                num_points2d = read_colmap_bytes(fid, 8, "Q")[0]
+                fid.seek(24 * int(num_points2d), os.SEEK_CUR)
+                images.append(
+                    {
+                        "id": int(props[0]),
+                        "qvec": np.array(props[1:5], dtype=np.float64),
+                        "tvec": np.array(props[5:8], dtype=np.float64),
+                        "camera_id": int(props[8]),
+                        "name": name_bytes.decode("utf-8"),
+                    }
+                )
+        return sorted(images, key=lambda item: item["name"])
+    if images_txt.exists():
+        lines = images_txt.read_text().splitlines()
+        index = 0
+        while index < len(lines):
+            line = lines[index].strip()
+            index += 1
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            images.append(
+                {
+                    "id": int(parts[0]),
+                    "qvec": np.array([float(item) for item in parts[1:5]], dtype=np.float64),
+                    "tvec": np.array([float(item) for item in parts[5:8]], dtype=np.float64),
+                    "camera_id": int(parts[8]),
+                    "name": parts[9],
+                }
+            )
+            index += 1
+    return sorted(images, key=lambda item: item["name"])
+
+
+def colmap_image_c2w(image: dict[str, Any]) -> np.ndarray:
+    w2c = np.eye(4, dtype=np.float32)
+    w2c[:3, :3] = qvec_to_rotmat(image["qvec"])
+    w2c[:3, 3] = image["tvec"].astype(np.float32)
+    return np.linalg.inv(w2c).astype(np.float32)
+
+
+def colmap_camera_intrinsics(camera: dict[str, Any]) -> dict[str, Any]:
+    params = camera["params"]
+    if camera["model"] == "PINHOLE":
+        fx, fy, cx, cy = params[:4]
+    elif camera["model"] == "SIMPLE_PINHOLE":
+        fx = fy = params[0]
+        cx, cy = params[1:3]
+    else:
+        return {
+            "width": camera["width"],
+            "height": camera["height"],
+            "model": camera["model"],
+        }
+    return {
+        "width": camera["width"],
+        "height": camera["height"],
+        "fx": float(fx),
+        "fy": float(fy),
+        "cx": float(cx),
+        "cy": float(cy),
+        "model": camera["model"],
+    }
+
+
+def numpy_farthest_point_indices(points: np.ndarray, count: int) -> np.ndarray:
+    total = len(points)
+    if count >= total:
+        return np.arange(total)
+    selected = [0]
+    min_distances = np.full(total, np.inf, dtype=np.float64)
+    for _ in range(1, count):
+        delta = points - points[selected[-1]]
+        min_distances = np.minimum(min_distances, np.sum(delta * delta, axis=1))
+        selected.append(int(np.argmax(min_distances)))
+    return np.sort(np.array(selected, dtype=np.int64))
+
+
+def initial_camera_for_job(job: dict[str, Any], frame_index: int = 0) -> dict[str, Any] | None:
+    dataset = job.get("colmap_dataset")
+    if not dataset:
+        return None
+    sparse_path = resolve_stored_path(dataset["scene"]) / dataset.get("sparse_dir", "sparse")
+    try:
+        cameras = read_colmap_cameras(sparse_path)
+        images = read_colmap_images(sparse_path)
+        if not cameras or not images:
+            return None
+        frame_index = min(max(0, int(frame_index)), len(images) - 1)
+        image = images[frame_index]
+        c2w = colmap_image_c2w(image)
+        if job.get("resplat_mode") != "batch_merge":
+            context_count = min(int(MODELS_BY_ID[job["model_id"]]["views"]), len(images))
+            all_c2w = np.stack([colmap_image_c2w(item) for item in images], axis=0)
+            context_indices = numpy_farthest_point_indices(all_c2w[:, :3, 3], context_count)
+            pivot = all_c2w[context_indices[len(context_indices) // 2]]
+            c2w = np.linalg.inv(pivot) @ c2w
+        return {
+            "frame_index": frame_index,
+            "image_name": image["name"],
+            "c2w": c2w.astype(float).tolist(),
+            "intrinsics": colmap_camera_intrinsics(cameras[image["camera_id"]]),
+            "convention": "opencv_c2w",
+        }
+    except Exception:
+        return None
+
 app = FastAPI(title="ReSplat Web UI")
 state_lock = threading.Lock()
 run_semaphore = threading.Semaphore(MAX_CONCURRENT_JOBS)
+metrics_lock = threading.Lock()
+last_cpu_sample: tuple[int, int] | None = None
+gpu_metrics_cache: tuple[float, list[dict[str, Any]]] | None = None
 
 
 @app.middleware("http")
@@ -212,24 +470,158 @@ def reset_colmap_workspace(root: Path) -> tuple[Path, Path, Path]:
     return raw_videos, work, proposals
 
 
+def create_gaussian_ply_preview(
+    source_path: Path,
+    preview_path: Path,
+    max_vertices: int = PLY_VIEWER_PREVIEW_MAX_VERTICES,
+) -> bool:
+    if not source_path.exists():
+        return False
+    if source_path.stat().st_size <= PLY_VIEWER_PREVIEW_MAX_BYTES:
+        return False
+    if (
+        preview_path.exists()
+        and preview_path.stat().st_mtime_ns >= source_path.stat().st_mtime_ns
+        and preview_path.stat().st_size > 0
+    ):
+        return True
+
+    with source_path.open("rb") as source:
+        header = bytearray()
+        while True:
+            line = source.readline()
+            if not line:
+                return False
+            header.extend(line)
+            if line == b"end_header\n":
+                break
+        data_offset = source.tell()
+
+    header_text = header.decode("ascii", errors="strict")
+    lines = header_text.splitlines()
+    if "format binary_little_endian 1.0" not in lines:
+        return False
+
+    vertex_count = 0
+    vertex_stride = 0
+    in_vertex = False
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "element":
+            in_vertex = parts[1] == "vertex"
+            if in_vertex:
+                vertex_count = int(parts[2])
+            continue
+        if in_vertex and len(parts) >= 3 and parts[0] == "property":
+            if parts[1] == "list":
+                return False
+            vertex_stride += PLY_TYPE_SIZES.get(parts[1], 0)
+
+    if vertex_count <= 0 or vertex_stride <= 0 or vertex_count <= max_vertices:
+        return False
+
+    preview_count = min(max_vertices, vertex_count)
+    tmp_path = preview_path.with_suffix(".tmp")
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    next_index_num = 0
+    with source_path.open("rb") as source, tmp_path.open("wb") as target:
+        preview_header = re.sub(
+            r"element vertex \d+",
+            f"element vertex {preview_count}",
+            header_text,
+            count=1,
+        )
+        target.write(preview_header.encode("ascii"))
+        for out_index in range(preview_count):
+            index = (out_index * vertex_count) // preview_count
+            if index < next_index_num:
+                index = next_index_num
+            source.seek(data_offset + index * vertex_stride)
+            target.write(source.read(vertex_stride))
+            next_index_num = index + 1
+    tmp_path.replace(preview_path)
+    return True
+
+
+def artifact_version(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    stat = path.stat()
+    return f"{int(stat.st_mtime_ns)}-{stat.st_size}"
+
+
+def job_batch_public(job: dict[str, Any], batch: dict[str, Any]) -> dict[str, Any]:
+    result_dir = Path(job["paths"]["results"])
+    batch_index = int(batch["index"])
+    batch_dir = result_dir / "batches" / f"batch_{batch_index:03d}"
+    ply_path = batch_dir / "gaussians_global_core.ply"
+    video_path = batch_dir / "video.mp4"
+    ply_version = artifact_version(ply_path)
+    video_version = artifact_version(video_path)
+    return {
+        **batch,
+        "label": f"batch {batch_index + 1:02d}",
+        "artifacts": {
+            "video": (
+                f"/api/jobs/{job['id']}/batches/{batch_index}/files/video.mp4?v={video_version}"
+                if video_version else None
+            ),
+            "ply": (
+                f"/api/jobs/{job['id']}/batches/{batch_index}/files/gaussians_global_core.ply?v={ply_version}"
+                if ply_version else None
+            ),
+            "viewer_ply": (
+                f"/api/jobs/{job['id']}/batches/{batch_index}/files/gaussians_global_core.ply?v={ply_version}"
+                if ply_version else None
+            ),
+            "video_version": video_version,
+            "ply_version": ply_version,
+            "viewer_ply_version": ply_version,
+            "initial_camera": initial_camera_for_job(job, int(batch.get("start") or 0)),
+        },
+    }
+
+
 def job_public(job: dict[str, Any]) -> dict[str, Any]:
     result_dir = Path(job["paths"]["results"])
     video_path = result_dir / "video.mp4"
     ply_path = result_dir / "gaussians.ply"
+    preview_ply_path = result_dir / "gaussians_preview.ply"
     enriched = dict(job)
+    manifest_path = result_dir / "batch_manifest.json"
     video_version = None
     ply_version = None
+    preview_ply_version = None
     if video_path.exists():
         stat = video_path.stat()
         video_version = f"{int(stat.st_mtime_ns)}-{stat.st_size}"
     if ply_path.exists():
         stat = ply_path.stat()
         ply_version = f"{int(stat.st_mtime_ns)}-{stat.st_size}"
+    if preview_ply_path.exists():
+        stat = preview_ply_path.stat()
+        preview_ply_version = f"{int(stat.st_mtime_ns)}-{stat.st_size}"
+    if manifest_path.exists() and not enriched.get("batch_manifest"):
+        try:
+            enriched["batch_manifest"] = json.loads(manifest_path.read_text())
+        except Exception:
+            pass
+    enriched["batches"] = [
+        job_batch_public(job, batch)
+        for batch in (enriched.get("batch_manifest") or {}).get("batches", [])
+    ]
     enriched["artifacts"] = {
         "video": f"/api/jobs/{job['id']}/files/video.mp4?v={video_version}" if video_version else None,
         "ply": f"/api/jobs/{job['id']}/files/gaussians.ply?v={ply_version}" if ply_version else None,
+        "viewer_ply": (
+            f"/api/jobs/{job['id']}/files/gaussians_preview.ply?v={preview_ply_version}"
+            if preview_ply_version
+            else (f"/api/jobs/{job['id']}/files/gaussians.ply?v={ply_version}" if ply_version else None)
+        ),
         "video_version": video_version,
         "ply_version": ply_version,
+        "viewer_ply_version": preview_ply_version or ply_version,
+        "initial_camera": initial_camera_for_job(job, 0),
     }
     return enriched
 
@@ -251,6 +643,8 @@ def colmap_public(job: dict[str, Any]) -> dict[str, Any]:
                         "inliers": item.get("inliers"),
                         "inlier_ratio": item.get("inlier_ratio"),
                         "rms_distance": item.get("rms_distance"),
+                        "angle_to_camera_up_deg": item.get("angle_to_camera_up_deg"),
+                        "camera_yz_track_angle_deg": item.get("camera_yz_track_angle_deg"),
                     }
                 )
         except Exception:
@@ -573,34 +967,56 @@ def run_resplat_job(job_id: str) -> None:
         if job.get("source_type") == "colmap":
             dataset = job["colmap_dataset"]
             frame_count = max(1, int(dataset.get("frame_count") or 1))
-            command = [
-                "python",
-                "scripts/infer_colmap.py",
-                "--model_preset",
-                model["preset"],
-                "--scene_path",
-                dataset["scene_container"],
-                "--start_frame",
-                "0",
-                "--frame_distance",
-                str(frame_count),
-                "--images_dir",
-                "images",
-                "--sparse_dir",
-                dataset.get("sparse_dir", "sparse"),
-                "--output_dir",
-                job["paths"]["results_container"],
-                "--target_selection",
-                "all",
-                "--save_images",
-                "--save_video",
-                "--save_ply",
-                "--render_chunk_size",
-                str(job["render_chunk_size"]),
-                "--no_eval",
-            ]
-            if frame_count < int(model["views"]):
-                command.extend(["--num_context", str(frame_count)])
+            if job.get("resplat_mode") == "batch_merge":
+                command = [
+                    "python",
+                    "scripts/infer_colmap_batch_merge.py",
+                    "--model_preset",
+                    model["preset"],
+                    "--scene_path",
+                    dataset["scene_container"],
+                    "--images_dir",
+                    "images",
+                    "--sparse_dir",
+                    dataset.get("sparse_dir", "sparse"),
+                    "--output_dir",
+                    job["paths"]["results_container"],
+                    "--batch_size",
+                    str(job["batch_size"]),
+                    "--batch_overlap",
+                    str(job["batch_overlap"]),
+                    "--render_chunk_size",
+                    str(job["render_chunk_size"]),
+                ]
+            else:
+                command = [
+                    "python",
+                    "scripts/infer_colmap.py",
+                    "--model_preset",
+                    model["preset"],
+                    "--scene_path",
+                    dataset["scene_container"],
+                    "--start_frame",
+                    "0",
+                    "--frame_distance",
+                    str(frame_count),
+                    "--images_dir",
+                    "images",
+                    "--sparse_dir",
+                    dataset.get("sparse_dir", "sparse"),
+                    "--output_dir",
+                    job["paths"]["results_container"],
+                    "--target_selection",
+                    "all",
+                    "--save_images",
+                    "--save_video",
+                    "--save_ply",
+                    "--render_chunk_size",
+                    str(job["render_chunk_size"]),
+                    "--no_eval",
+                ]
+                if frame_count < int(model["views"]):
+                    command.extend(["--num_context", str(frame_count)])
             shape = PRESET_SHAPES.get(model["preset"])
             if shape is not None:
                 command.extend(["--image_shape", str(shape[0]), str(shape[1])])
@@ -649,7 +1065,26 @@ def run_resplat_job(job_id: str) -> None:
             result = client.api.exec_inspect(exec_id)
             exit_code = result.get("ExitCode", 1)
             if exit_code == 0:
-                update_job(job_id, status="succeeded", finished_at=utc_now(), exit_code=exit_code)
+                updates: dict[str, Any] = {
+                    "status": "succeeded",
+                    "finished_at": utc_now(),
+                    "exit_code": exit_code,
+                }
+                try:
+                    if create_gaussian_ply_preview(
+                        Path(job["paths"]["results"]) / "gaussians.ply",
+                        Path(job["paths"]["results"]) / "gaussians_preview.ply",
+                    ):
+                        append_log(job_id, "\n[frontend] Wrote gaussians_preview.ply for browser viewer.\n")
+                except Exception as exc:
+                    append_log(job_id, f"\n[frontend] Failed to write viewer preview PLY: {exc}\n")
+                manifest_path = Path(job["paths"]["results"]) / "batch_manifest.json"
+                if manifest_path.exists():
+                    try:
+                        updates["batch_manifest"] = json.loads(manifest_path.read_text())
+                    except Exception as exc:
+                        append_log(job_id, f"\n[frontend] Failed to read batch manifest: {exc}\n")
+                update_job(job_id, **updates)
             else:
                 update_job(
                     job_id,
@@ -723,6 +1158,8 @@ def run_colmap_job(job_id: str) -> None:
             str(job["num_candidates"]),
             "--iterations",
             str(job["ransac_iterations"]),
+            "--threshold",
+            str(COLMAP_GROUND_RANSAC_THRESHOLD),
         ]
 
         def log(text: str) -> None:
@@ -756,13 +1193,21 @@ def run_colmap_job(job_id: str) -> None:
                 )
                 return
 
+            proposal_count = len(list(proposals_host.glob("candidate_*_zy.png")))
+            proposals_json = proposals_host / "ground_proposals.json"
+            if proposals_json.exists():
+                try:
+                    proposal_count = len(json.loads(proposals_json.read_text()).get("candidates", []))
+                except Exception as exc:
+                    append_colmap_log(job_id, f"\n[frontend] Failed to read proposal count: {exc}\n")
+
             update_colmap_job(
                 job_id,
                 status="proposed",
                 finished_at=utc_now(),
                 exit_code=0,
                 frame_count=frame_count,
-                proposal_count=len(list(proposals_host.glob("candidate_*_zy.png"))),
+                proposal_count=proposal_count,
             )
         except Exception as exc:
             append_colmap_log(job_id, f"\n[frontend] {type(exc).__name__}: {exc}\n")
@@ -794,6 +1239,238 @@ def prepare_storage() -> None:
                 job["error"] = "Frontend restarted while this COLMAP job was active."
                 job["updated_at"] = utc_now()
         save_state(state)
+
+
+def read_cpu_sample() -> tuple[int, int]:
+    with open("/proc/stat", "r", encoding="utf-8") as handle:
+        fields = handle.readline().split()
+    if not fields or fields[0] != "cpu":
+        raise RuntimeError("Could not read aggregate CPU stats")
+    values = [int(value) for value in fields[1:]]
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    total = sum(values)
+    return idle, total
+
+
+def cpu_utilization_percent() -> float | None:
+    global last_cpu_sample
+    with metrics_lock:
+        previous = last_cpu_sample
+        if previous is None:
+            previous = read_cpu_sample()
+            time.sleep(0.05)
+        current = read_cpu_sample()
+        last_cpu_sample = current
+    idle_delta = current[0] - previous[0]
+    total_delta = current[1] - previous[1]
+    if total_delta <= 0:
+        return None
+    busy = 1.0 - (idle_delta / total_delta)
+    return round(max(0.0, min(100.0, busy * 100.0)), 1)
+
+
+def parse_optional_float(value: str) -> float | None:
+    text = value.strip()
+    if not text or text.lower() in {"[not supported]", "not supported", "n/a"}:
+        return None
+    try:
+        return float(text.split()[0])
+    except ValueError:
+        return None
+
+
+def parse_gpu_metrics(output: str) -> list[dict[str, Any]]:
+    gpus = []
+    reader = csv.reader(io.StringIO(output))
+    for fallback_index, row in enumerate(reader):
+        if not row:
+            continue
+        values = [item.strip() for item in row]
+        if len(values) < 6:
+            continue
+        index_text, uuid, name, utilization_text, memory_used_text, memory_total_text = values[:6]
+        try:
+            index = int(index_text)
+        except ValueError:
+            index = fallback_index
+        utilization = parse_optional_float(utilization_text)
+        memory_used = parse_optional_float(memory_used_text)
+        memory_total = parse_optional_float(memory_total_text)
+        memory_percent = None
+        if memory_used is not None and memory_total and memory_total > 0:
+            memory_percent = round(max(0.0, min(100.0, memory_used / memory_total * 100.0)), 1)
+        gpus.append(
+            {
+                "index": index,
+                "uuid": uuid,
+                "name": name,
+                "utilization": round(utilization, 1) if utilization is not None else None,
+                "memory_used_mb": round(memory_used, 1) if memory_used is not None else None,
+                "memory_total_mb": round(memory_total, 1) if memory_total is not None else None,
+                "memory_percent": memory_percent,
+                "process_count": 0,
+                "process_memory_mb": 0.0,
+            }
+        )
+    return gpus
+
+
+def attach_gpu_process_metrics(gpus: list[dict[str, Any]], output: str) -> None:
+    by_uuid = {gpu.get("uuid"): gpu for gpu in gpus if gpu.get("uuid")}
+    reader = csv.reader(io.StringIO(output))
+    for row in reader:
+        if len(row) < 4:
+            continue
+        uuid, _pid, _process_name, used_memory_text = [item.strip() for item in row[:4]]
+        gpu = by_uuid.get(uuid)
+        if gpu is None:
+            continue
+        used_memory = parse_optional_float(used_memory_text) or 0.0
+        gpu["process_count"] = int(gpu.get("process_count") or 0) + 1
+        gpu["process_memory_mb"] = round(float(gpu.get("process_memory_mb") or 0.0) + used_memory, 1)
+
+
+def local_gpu_metrics() -> list[dict[str, Any]]:
+    if shutil.which("nvidia-smi") is None:
+        return []
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=1.5,
+    )
+    if result.returncode != 0:
+        return []
+    gpus = parse_gpu_metrics(result.stdout)
+    try:
+        process_result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        if process_result.returncode == 0:
+            attach_gpu_process_metrics(gpus, process_result.stdout)
+    except Exception:
+        pass
+    return gpus
+
+
+def container_nvidia_smi(client: docker.DockerClient, query: str) -> str | None:
+    container = client.containers.get(RESPLAT_CONTAINER)
+    exec_id = client.api.exec_create(
+        container.id,
+        [
+            "nvidia-smi",
+            query,
+            "--format=csv,noheader,nounits",
+        ],
+    )["Id"]
+    output = client.api.exec_start(exec_id, stream=False)
+    result = client.api.exec_inspect(exec_id)
+    if int(result.get("ExitCode", 1)) != 0:
+        return None
+    return output.decode("utf-8", errors="replace")
+
+
+def container_gpu_metrics() -> list[dict[str, Any]]:
+    client = docker.from_env()
+    output = container_nvidia_smi(
+        client,
+        "--query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total",
+    )
+    if output is None:
+        return []
+    gpus = parse_gpu_metrics(output)
+    try:
+        process_output = container_nvidia_smi(
+            client,
+            "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+        )
+        if process_output is not None:
+            attach_gpu_process_metrics(gpus, process_output)
+    except Exception:
+        pass
+    return gpus
+
+
+def gpu_metrics() -> list[dict[str, Any]]:
+    global gpu_metrics_cache
+    now = time.monotonic()
+    with metrics_lock:
+        if gpu_metrics_cache is not None and now - gpu_metrics_cache[0] < 2.5:
+            return gpu_metrics_cache[1]
+    try:
+        gpus = local_gpu_metrics()
+    except Exception:
+        gpus = []
+    if not gpus:
+        try:
+            gpus = container_gpu_metrics()
+        except Exception:
+            gpus = []
+    with metrics_lock:
+        gpu_metrics_cache = (now, gpus)
+    return gpus
+
+
+@app.get("/api/system-metrics")
+def system_metrics() -> dict[str, Any]:
+    cpu = cpu_utilization_percent()
+    gpus = gpu_metrics()
+    utilization_values = [
+        float(item["utilization"])
+        for item in gpus
+        if item.get("utilization") is not None
+    ]
+    memory_used_mb = sum(float(item.get("memory_used_mb") or 0.0) for item in gpus)
+    memory_total_mb = sum(float(item.get("memory_total_mb") or 0.0) for item in gpus)
+    process_count = sum(int(item.get("process_count") or 0) for item in gpus)
+    if gpus:
+        gpu_average = round(sum(utilization_values) / len(utilization_values), 1) if utilization_values else None
+        gpu_max = round(max(utilization_values), 1) if utilization_values else None
+        memory_percent = (
+            round(max(0.0, min(100.0, memory_used_mb / memory_total_mb * 100.0)), 1)
+            if memory_total_mb > 0
+            else None
+        )
+        active = bool(
+            (gpu_max is not None and gpu_max > 0)
+            or process_count > 0
+            or (memory_percent is not None and memory_percent >= 1.0)
+        )
+    else:
+        gpu_average = None
+        gpu_max = None
+        memory_percent = None
+        active = False
+    return {
+        "timestamp": utc_now(),
+        "cpu": {"utilization": cpu},
+        "gpu": {
+            "available": bool(gpus),
+            "active": active,
+            "utilization": gpu_max,
+            "average_utilization": gpu_average,
+            "memory": {
+                "used_mb": round(memory_used_mb, 1) if gpus else None,
+                "total_mb": round(memory_total_mb, 1) if gpus else None,
+                "percent": memory_percent,
+            },
+            "process_count": process_count,
+            "gpus": gpus,
+        },
+    }
 
 
 @app.get("/api/models")
@@ -1128,8 +1805,9 @@ async def create_job(request: Request) -> dict[str, Any]:
     upload_ids = form_upload_ids(form)
     existing_videos = form_existing_videos(form)
     model_id = form_string(form, "model_id")
-    source_type = form_string(form, "source_type", "video")
+    source_type = form_string(form, "source_type", "colmap")
     dataset_id = form_string(form, "dataset_id", "")
+    requested_resplat_mode = form_string(form, "resplat_mode", "single")
     sample_fps = form_float(form, "sample_fps")
     render_chunk_size = form_int(form, "render_chunk_size", 2)
     start_time = form_float(form, "start_time", None)
@@ -1140,6 +1818,7 @@ async def create_job(request: Request) -> dict[str, Any]:
             f"received multipart fields={list(form.keys())} "
             f"files={len(files)} staged_uploads={len(upload_ids)} existing_videos={len(existing_videos)} names={upload_names} "
             f"model_id={model_id!r} source_type={source_type!r} dataset_id={dataset_id!r} "
+            f"resplat_mode={requested_resplat_mode!r} "
             f"sample_fps={sample_fps!r} "
             f"render_chunk_size={render_chunk_size!r} "
             f"start_time={start_time!r} end_time={end_time!r}"
@@ -1148,15 +1827,20 @@ async def create_job(request: Request) -> dict[str, Any]:
 
     if model_id not in MODELS_BY_ID:
         reject_job_request(f"Unknown ReSplat model: {model_id!r}")
-    if source_type not in {"video", "colmap"}:
-        reject_job_request("Unknown source type")
+    if source_type != "colmap":
+        reject_job_request("ReSplat pipeline jobs must use a saved COLMAP dataset")
+    if files or upload_ids or existing_videos:
+        reject_job_request("Video uploads are disabled for ReSplat pipeline jobs; use a COLMAP dataset")
+    if requested_resplat_mode not in {"single", "batch_merge"}:
+        reject_job_request("Unknown ReSplat mode")
     colmap_dataset = None
-    if source_type == "colmap":
-        if not dataset_id:
-            reject_job_request("Select a COLMAP dataset")
-        colmap_dataset = get_colmap_dataset(dataset_id)
-    elif not files and not upload_ids and not existing_videos:
-        reject_job_request("Select or upload at least one video")
+    if not dataset_id:
+        reject_job_request("Select a COLMAP dataset")
+    colmap_dataset = get_colmap_dataset(dataset_id)
+    if requested_resplat_mode == "batch_merge" and not dataset_ground_alignment_path(colmap_dataset).exists():
+        reject_job_request(
+            "Batch merge requires a ground-aligned COLMAP dataset with ground_alignment.json"
+        )
     if source_type == "video" and sample_fps is None:
         reject_job_request("sample_fps is required")
     if source_type == "video" and (sample_fps <= 0 or sample_fps > 60):
@@ -1172,6 +1856,15 @@ async def create_job(request: Request) -> dict[str, Any]:
 
     job_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     root = job_dir(job_id)
+
+    model = MODELS_BY_ID[model_id]
+    frame_count = int(colmap_dataset.get("frame_count") or 0) if colmap_dataset else 0
+    batch_size = int(model["views"])
+    batch_overlap = max(2, batch_size // 4)
+    resplat_mode = requested_resplat_mode
+    if source_type != "colmap":
+        resplat_mode = "single"
+    batch_count = plan_batch_count(frame_count, batch_size, batch_overlap) if resplat_mode == "batch_merge" else 1
 
     upload_plan = []
     if source_type == "video":
@@ -1201,7 +1894,12 @@ async def create_job(request: Request) -> dict[str, Any]:
         "status": "queued",
         "source_type": source_type,
         "model_id": model_id,
-        "model_preset": MODELS_BY_ID[model_id]["preset"],
+        "model_preset": model["preset"],
+        "resplat_mode": resplat_mode,
+        "batch_size": batch_size if resplat_mode == "batch_merge" else None,
+        "batch_overlap": batch_overlap if resplat_mode == "batch_merge" else None,
+        "batch_count": batch_count if resplat_mode == "batch_merge" else None,
+        "batch_manifest": None,
         "sample_fps": sample_fps,
         "render_chunk_size": render_chunk_size,
         "start_time": start_time,
@@ -1236,6 +1934,13 @@ async def create_job(request: Request) -> dict[str, Any]:
             [
                 f"[frontend] Created isolated task {job_id}\n",
                 f"[frontend] Source type: {source_type}\n",
+                f"[frontend] ReSplat mode: {resplat_mode}\n",
+                (
+                    f"[frontend] Batch merge: {batch_count} batches, "
+                    f"batch_size={batch_size}, overlap={batch_overlap}, "
+                    "coordinate_frame=ground_aligned_z0\n"
+                    if resplat_mode == "batch_merge" else ""
+                ),
                 (
                     f"[frontend] COLMAP dataset: {colmap_dataset['id']} "
                     f"candidate {colmap_dataset['candidate_id']}\n"
@@ -1275,7 +1980,7 @@ def get_logs(job_id: str) -> PlainTextResponse:
 
 
 @app.get("/api/jobs/{job_id}/files/{filename}")
-def get_file(job_id: str, filename: str) -> FileResponse:
+def get_file(request: Request, job_id: str, filename: str) -> FileResponse:
     if filename not in ALLOWED_DOWNLOADS:
         raise HTTPException(status_code=404, detail="File not found")
     with state_lock:
@@ -1283,6 +1988,27 @@ def get_file(job_id: str, filename: str) -> FileResponse:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     path = Path(job["paths"]["results"]) / filename
+    if filename == "gaussians.ply" and "t" in request.query_params:
+        preview_path = Path(job["paths"]["results"]) / "gaussians_preview.ply"
+        if preview_path.exists():
+            path = preview_path
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not ready")
+    media_type = "video/mp4" if filename == "video.mp4" else "application/octet-stream"
+    return FileResponse(path, media_type=media_type, filename=filename)
+
+
+@app.get("/api/jobs/{job_id}/batches/{batch_index}/files/{filename}")
+def get_batch_file(job_id: str, batch_index: int, filename: str) -> FileResponse:
+    if filename not in {"video.mp4", "gaussians_global_core.ply"}:
+        raise HTTPException(status_code=404, detail="File not found")
+    with state_lock:
+        job = load_state()["jobs"].get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if batch_index < 0:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    path = Path(job["paths"]["results"]) / "batches" / f"batch_{batch_index:03d}" / filename
     if not path.exists():
         raise HTTPException(status_code=404, detail="File not ready")
     media_type = "video/mp4" if filename == "video.mp4" else "application/octet-stream"

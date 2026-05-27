@@ -32,6 +32,10 @@ BaseImage = collections.namedtuple(
     "ColmapImage",
     ["id", "qvec", "tvec", "camera_id", "name", "xys", "point3D_ids"],
 )
+ColmapFrame = collections.namedtuple(
+    "ColmapFrame",
+    ["id", "rig_id", "qvec", "tvec", "data_ids"],
+)
 Point3D = collections.namedtuple(
     "Point3D", ["id", "xyz", "rgb", "error", "image_ids", "point2D_idxs"]
 )
@@ -242,6 +246,49 @@ def write_points3d_binary(points3d: dict[int, Point3D], path: Path) -> None:
                 fid.write(struct.pack("<ii", int(image_id), int(point2d_idx)))
 
 
+def read_frames_binary(path: Path) -> dict[int, ColmapFrame]:
+    frames = {}
+    with path.open("rb") as fid:
+        num_frames = read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_frames):
+            frame_id, rig_id = read_next_bytes(fid, 8, "II")
+            qvec = np.array(read_next_bytes(fid, 32, "dddd"), dtype=np.float64)
+            tvec = np.array(read_next_bytes(fid, 24, "ddd"), dtype=np.float64)
+            num_data_ids = read_next_bytes(fid, 4, "I")[0]
+            data_ids = []
+            for _ in range(num_data_ids):
+                sensor_type, sensor_id, data_id = read_next_bytes(fid, 16, "iIQ")
+                data_ids.append((int(sensor_type), int(sensor_id), int(data_id)))
+            frames[frame_id] = ColmapFrame(
+                id=frame_id,
+                rig_id=rig_id,
+                qvec=qvec,
+                tvec=tvec,
+                data_ids=tuple(data_ids),
+            )
+    return frames
+
+
+def write_frames_binary(frames: dict[int, ColmapFrame], path: Path) -> None:
+    with path.open("wb") as fid:
+        fid.write(struct.pack("<Q", len(frames)))
+        for frame_id in sorted(frames):
+            frame = frames[frame_id]
+            fid.write(struct.pack("<II", int(frame.id), int(frame.rig_id)))
+            fid.write(struct.pack("<dddd", *frame.qvec.tolist()))
+            fid.write(struct.pack("<ddd", *frame.tvec.tolist()))
+            fid.write(struct.pack("<I", len(frame.data_ids)))
+            for sensor_type, sensor_id, data_id in frame.data_ids:
+                fid.write(
+                    struct.pack(
+                        "<iIQ",
+                        int(sensor_type),
+                        int(sensor_id),
+                        int(data_id),
+                    )
+                )
+
+
 def sparse_path_for_scene(scene_path: Path, sparse_dir: str | None) -> Path:
     if sparse_dir:
         path = scene_path / sparse_dir
@@ -356,6 +403,25 @@ def camera_height_stats(
     heights = centers @ normal + d
     above_ratio = float(np.mean(heights > 0.0))
     return float(np.min(heights)), float(np.median(heights)), above_ratio
+
+
+def camera_yz_track_angle_degrees(transformed_centers: np.ndarray) -> float:
+    """Estimate the camera-track tilt visible in the z-y proposal plot."""
+    if len(transformed_centers) < 2:
+        return 0.0
+
+    yz = transformed_centers[:, [1, 2]]
+    yz = yz[np.isfinite(yz).all(axis=1)]
+    if len(yz) < 2:
+        return 0.0
+
+    centered = yz - yz.mean(axis=0)
+    _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
+    if singular_values[0] < 1e-8:
+        return 0.0
+
+    direction = vh[0]
+    return float(math.degrees(math.atan2(abs(direction[1]), abs(direction[0]))))
 
 
 def plane_is_duplicate(
@@ -647,6 +713,11 @@ def command_propose(args: argparse.Namespace) -> None:
     sparse_path = sparse_path_for_scene(scene_path, args.sparse_dir)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    for old_image in output_dir.glob("candidate_*_zy.png"):
+        old_image.unlink()
+    for old_file in (output_dir / "overview_zy.png", output_dir / "ground_proposals.json"):
+        if old_file.exists():
+            old_file.unlink()
 
     _, images, points3d = read_model(sparse_path)
     _, points = points_array(points3d)
@@ -674,6 +745,10 @@ def command_propose(args: argparse.Namespace) -> None:
     if min_inliers is None:
         min_inliers = max(50, int(len(ransac_points) * args.min_inlier_ratio))
 
+    candidate_pool_size = max(
+        args.num_candidates,
+        args.num_candidates * max(1, args.candidate_pool_multiplier),
+    )
     candidates = ransac_planes(
         ransac_points,
         camera_centers=centers,
@@ -682,7 +757,7 @@ def command_propose(args: argparse.Namespace) -> None:
         min_camera_above_ratio=args.min_camera_above_ratio,
         iterations=args.iterations,
         threshold=threshold,
-        max_candidates=args.num_candidates,
+        max_candidates=candidate_pool_size,
         min_inliers=min_inliers,
         angle_tol_deg=args.angle_tol_deg,
         seed=args.seed,
@@ -694,13 +769,34 @@ def command_propose(args: argparse.Namespace) -> None:
 
     image_paths = []
     proposal_items = []
-    for candidate_id, candidate in enumerate(candidates):
+    rejected_candidates = []
+    for candidate in candidates:
         transform, oriented_normal, oriented_d = transform_for_plane(
             np.array(candidate["normal"], dtype=np.float64),
             float(candidate["d"]),
             points,
             centers,
         )
+        transformed_centers = apply_transform(centers, transform)
+        track_angle = camera_yz_track_angle_degrees(transformed_centers)
+        if (
+            not args.disable_camera_prior
+            and args.max_camera_track_angle_deg is not None
+            and track_angle > args.max_camera_track_angle_deg
+        ):
+            rejected_candidates.append(
+                {
+                    "inliers": candidate["inliers"],
+                    "inlier_ratio": candidate["inlier_ratio"],
+                    "rms_distance": candidate["rms_distance"],
+                    "angle_to_camera_up_deg": candidate.get("angle_to_camera_up_deg"),
+                    "camera_yz_track_angle_deg": track_angle,
+                    "reason": "camera_track_angle",
+                }
+            )
+            continue
+
+        candidate_id = len(proposal_items)
         image_name = f"candidate_{candidate_id:02d}_zy.png"
         image_path = output_dir / image_name
         angle_text = ""
@@ -709,7 +805,7 @@ def command_propose(args: argparse.Namespace) -> None:
         title = (
             f"candidate {candidate_id}: inliers={candidate['inliers']} "
             f"ratio={candidate['inlier_ratio']:.3f} rms={candidate['rms_distance']:.4g}"
-            f"{angle_text} h={candidate['median_camera_height']:.3g}"
+            f"{angle_text} track={track_angle:.1f}deg h={candidate['median_camera_height']:.3g}"
         )
         plot_candidate(
             image_path,
@@ -732,6 +828,7 @@ def command_propose(args: argparse.Namespace) -> None:
                 "inlier_ratio": candidate["inlier_ratio"],
                 "rms_distance": candidate["rms_distance"],
                 "angle_to_camera_up_deg": candidate.get("angle_to_camera_up_deg"),
+                "camera_yz_track_angle_deg": track_angle,
                 "min_camera_height": candidate.get("min_camera_height"),
                 "median_camera_height": candidate.get("median_camera_height"),
                 "camera_above_ratio": candidate.get("camera_above_ratio"),
@@ -739,6 +836,15 @@ def command_propose(args: argparse.Namespace) -> None:
                 "d": float(oriented_d),
                 "transform": transform.tolist(),
             }
+        )
+        if len(proposal_items) >= args.num_candidates:
+            break
+
+    if not proposal_items:
+        raise RuntimeError(
+            "RANSAC found no usable planes after camera-track filtering. "
+            f"Try increasing --max_camera_track_angle_deg above {args.max_camera_track_angle_deg:g} "
+            f"or increasing --threshold above {threshold:.6g}."
         )
 
     overview_path = output_dir / "overview_zy.png"
@@ -754,40 +860,75 @@ def command_propose(args: argparse.Namespace) -> None:
         "camera_up_normal": reference_normal.tolist(),
         "camera_prior_enabled": not args.disable_camera_prior,
         "max_normal_angle_deg": args.max_normal_angle_deg,
+        "max_camera_track_angle_deg": args.max_camera_track_angle_deg,
         "min_camera_above_ratio": args.min_camera_above_ratio,
+        "candidate_pool_count": len(candidates),
+        "rejected_candidates": rejected_candidates,
         "candidates": proposal_items,
     }
     proposals_path = output_dir / "ground_proposals.json"
     proposals_path.write_text(json.dumps(proposals, indent=2), encoding="utf-8")
 
     print(f"Wrote {len(proposal_items)} candidates to {proposals_path}")
+    if rejected_candidates:
+        print(f"Rejected {len(rejected_candidates)} candidates before final output")
     print(f"Overview: {overview_path}")
     for item in proposal_items:
         print(
             f"  candidate {item['id']}: inliers={item['inliers']} "
             f"ratio={item['inlier_ratio']:.3f} "
             f"angle={item['angle_to_camera_up_deg'] if item['angle_to_camera_up_deg'] is not None else 'n/a'} "
+            f"track={item['camera_yz_track_angle_deg']:.2f} "
             f"camera_above={item['camera_above_ratio']:.2f} image={output_dir / item['image']}"
         )
 
 
-def transformed_images(images: dict[int, ColmapImage], transform: np.ndarray) -> dict[int, ColmapImage]:
+def transform_world_to_camera_pose(
+    qvec: np.ndarray,
+    tvec: np.ndarray,
+    transform: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    w2c = np.eye(4, dtype=np.float64)
+    w2c[:3, :3] = qvec2rotmat(qvec)
+    w2c[:3, 3] = tvec
+    c2w = np.linalg.inv(w2c)
+    new_c2w = transform @ c2w
+    new_w2c = np.linalg.inv(new_c2w)
+    return rotmat2qvec(new_w2c[:3, :3]), new_w2c[:3, 3].astype(np.float64)
+
+
+def transformed_images(
+    images: dict[int, ColmapImage],
+    transform: np.ndarray,
+) -> dict[int, ColmapImage]:
     out = {}
     for image_id, img in images.items():
-        w2c = np.eye(4, dtype=np.float64)
-        w2c[:3, :3] = qvec2rotmat(img.qvec)
-        w2c[:3, 3] = img.tvec
-        c2w = np.linalg.inv(w2c)
-        new_c2w = transform @ c2w
-        new_w2c = np.linalg.inv(new_c2w)
+        qvec, tvec = transform_world_to_camera_pose(img.qvec, img.tvec, transform)
         out[image_id] = ColmapImage(
             id=img.id,
-            qvec=rotmat2qvec(new_w2c[:3, :3]),
-            tvec=new_w2c[:3, 3].astype(np.float64),
+            qvec=qvec,
+            tvec=tvec,
             camera_id=img.camera_id,
             name=img.name,
             xys=img.xys,
             point3D_ids=img.point3D_ids,
+        )
+    return out
+
+
+def transformed_frames(
+    frames: dict[int, ColmapFrame],
+    transform: np.ndarray,
+) -> dict[int, ColmapFrame]:
+    out = {}
+    for frame_id, frame in frames.items():
+        qvec, tvec = transform_world_to_camera_pose(frame.qvec, frame.tvec, transform)
+        out[frame_id] = ColmapFrame(
+            id=frame.id,
+            rig_id=frame.rig_id,
+            qvec=qvec,
+            tvec=tvec,
+            data_ids=frame.data_ids,
         )
     return out
 
@@ -857,7 +998,15 @@ def command_apply(args: argparse.Namespace) -> None:
     write_images_binary(new_images, output_sparse_path / "images.bin")
     write_points3d_binary(new_points, output_sparse_path / "points3D.bin")
 
-    for name in ["rigs.bin", "frames.bin", "project.ini"]:
+    frames_path = sparse_path / "frames.bin"
+    if frames_path.exists():
+        frames = read_frames_binary(frames_path)
+        write_frames_binary(
+            transformed_frames(frames, transform),
+            output_sparse_path / "frames.bin",
+        )
+
+    for name in ["rigs.bin", "project.ini"]:
         source = sparse_path / name
         if source.exists():
             shutil.copy2(source, output_sparse_path / name)
@@ -890,18 +1039,25 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--output_dir", type=Path, required=True)
     propose.add_argument("--num_candidates", type=int, default=8)
     propose.add_argument("--iterations", type=int, default=12000)
-    propose.add_argument("--threshold", type=float, default=None)
+    propose.add_argument("--threshold", type=float, default=0.05)
     propose.add_argument("--threshold_ratio", type=float, default=0.008)
     propose.add_argument("--min_inliers", type=int, default=None)
     propose.add_argument("--min_inlier_ratio", type=float, default=0.02)
     propose.add_argument("--max_ransac_points", type=int, default=50000)
     propose.add_argument("--max_plot_points", type=int, default=160000)
     propose.add_argument("--angle_tol_deg", type=float, default=10.0)
+    propose.add_argument("--candidate_pool_multiplier", type=int, default=8)
     propose.add_argument(
         "--max_normal_angle_deg",
         type=float,
         default=10.0,
         help="Reject candidate planes whose normal differs from camera-estimated up by more than this angle.",
+    )
+    propose.add_argument(
+        "--max_camera_track_angle_deg",
+        type=float,
+        default=10.0,
+        help="Reject candidates whose z-y camera track tilts more than this after alignment.",
     )
     propose.add_argument(
         "--min_camera_above_ratio",

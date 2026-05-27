@@ -120,6 +120,8 @@ def run_final_bundle_adjustment(
             "200",
             "--BundleAdjustmentCeres.use_gpu",
             str(use_gpu),
+            "--BundleAdjustmentCeres.min_num_images_gpu_solver",
+            "1",
         ]
     )
     return ba_output
@@ -325,6 +327,8 @@ def run_colmap(
             str(raw_images),
             "--output_path",
             str(sparse_dir),
+            "--Mapper.ba_use_gpu",
+            str(use_gpu),
         ]
     )
 

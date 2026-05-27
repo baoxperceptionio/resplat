@@ -51,9 +51,9 @@ select,
 .topbar {
   display: grid;
   grid-column: 1 / -1;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: 220px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 20px;
+  gap: 16px;
   border-bottom: 1px solid var(--line);
   background: #fff;
   padding: 8px 16px;
@@ -162,6 +162,35 @@ select,
   border-color: var(--teal);
   background: var(--teal);
   color: #fff;
+}
+
+.system-metrics {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: max-content;
+}
+
+.metric-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #f7faf7;
+  color: var(--muted);
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.metric-pill strong {
+  min-width: 34px;
+  color: var(--ink);
+  font-size: 13px;
+  text-align: right;
 }
 
 .tab-panel {
@@ -342,6 +371,11 @@ button:disabled {
   gap: 8px;
 }
 
+.job-group {
+  display: grid;
+  gap: 6px;
+}
+
 .job-card {
   display: grid;
   gap: 7px;
@@ -355,6 +389,42 @@ button:disabled {
 .job-card.active {
   border-color: var(--teal);
   box-shadow: 0 0 0 2px rgba(21, 118, 111, 0.12);
+}
+
+.batch-list {
+  display: grid;
+  gap: 5px;
+  padding-left: 14px;
+}
+
+.batch-card {
+  display: grid;
+  grid-template-columns: minmax(70px, auto) 1fr;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  padding: 8px 9px;
+  text-align: left;
+}
+
+.batch-card.active {
+  border-color: var(--teal);
+  background: rgba(21, 118, 111, 0.07);
+}
+
+.batch-card span {
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.batch-card small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .job-top {
@@ -731,7 +801,7 @@ body.resizing {
 @media (max-width: 900px) {
   .app-shell {
     grid-template-columns: 1fr;
-    grid-template-rows: 92px auto 1fr;
+    grid-template-rows: 132px auto 1fr;
     height: auto;
     min-height: 100vh;
   }
@@ -739,6 +809,11 @@ body.resizing {
   .topbar {
     grid-template-columns: 1fr;
     align-content: center;
+    gap: 8px;
+  }
+
+  .system-metrics {
+    justify-content: flex-start;
   }
 
   .sidebar {

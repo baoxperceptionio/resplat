@@ -9,14 +9,19 @@ ARG TORCHVISION_VERSION=0.22.0
 ARG TORCH_CUDA_ARCH_LIST=9.0
 ARG COLMAP_CUDA_ARCHITECTURES=90
 ARG MAX_JOBS=8
+ARG TARGETARCH
+ARG CUDSS_VERSION=0.7.1.4
+ARG CERES_GIT_REF=0ba987acaf9e8674070f116ed624edf017d2b630
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     CUDA_HOME=/usr/local/cuda \
+    CUDSS_ROOT=/opt/cudss \
     FORCE_CUDA=1 \
     PATH=/usr/local/cuda/bin:${PATH} \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    LD_LIBRARY_PATH=/opt/cudss/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    CMAKE_PREFIX_PATH=/opt/cudss:${CMAKE_PREFIX_PATH} \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     MAX_JOBS=${MAX_JOBS} \
     PYTHONPATH=/workspace/resplat \
@@ -39,9 +44,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libboost-graph-dev \
         libboost-program-options-dev \
         libboost-system-dev \
-        libceres-dev \
         libcurl4-openssl-dev \
         libeigen3-dev \
+        libgflags-dev \
         libglew-dev \
         libglib2.0-0 \
         libgl1 \
@@ -75,13 +80,66 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace/resplat
 
-# Build COLMAP from source with CUDA support. Ubuntu repository COLMAP builds
-# are CPU-only; ReSplat only needs the CLI/SfM path, so GUI/MVS/ONNX are disabled
-# to keep the build smaller while preserving CUDA SIFT extraction/matching.
+# Install cuDSS and build Ceres from source with CUDA/cuDSS support. The Ubuntu
+# libceres-dev package does not provide the cuDSS-enabled sparse GPU solvers
+# required by COLMAP's GPU bundle adjustment path.
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) \
+            CUDSS_PLATFORM="linux-x86_64"; \
+            CUDSS_SHA256="946571d9ea164f948e402dd97a14541cb90fbec800336cfa7ae644af5937632f"; \
+            ;; \
+        arm64) \
+            CUDSS_PLATFORM="linux-sbsa"; \
+            CUDSS_SHA256="a4ddd47ad711243bbea0da2d6520799595cc8d79aa740927e0855c0b8cb69cf8"; \
+            ;; \
+        *) \
+            echo "Unsupported Docker TARGETARCH for cuDSS: ${TARGETARCH}" >&2; \
+            exit 1; \
+            ;; \
+    esac; \
+    CUDSS_ARCHIVE="libcudss-${CUDSS_PLATFORM}-${CUDSS_VERSION}_cuda12-archive"; \
+    curl -fsSL "https://developer.download.nvidia.com/compute/cudss/redist/libcudss/${CUDSS_PLATFORM}/${CUDSS_ARCHIVE}.tar.xz" -o /tmp/cudss.tar.xz; \
+    echo "${CUDSS_SHA256}  /tmp/cudss.tar.xz" | sha256sum -c -; \
+    mkdir -p "${CUDSS_ROOT}"; \
+    tar -xJf /tmp/cudss.tar.xz -C /tmp; \
+    cp -a "/tmp/${CUDSS_ARCHIVE}/include" "/tmp/${CUDSS_ARCHIVE}/lib" "${CUDSS_ROOT}/"; \
+    echo "${CUDSS_ROOT}/lib" > /etc/ld.so.conf.d/cudss.conf; \
+    ldconfig; \
+    rm -rf /tmp/cudss.tar.xz "/tmp/${CUDSS_ARCHIVE}"
+
+RUN git clone --depth 1 https://github.com/ceres-solver/ceres-solver.git /tmp/ceres \
+    && cd /tmp/ceres \
+    && git checkout ${CERES_GIT_REF} \
+    && git submodule update --init --recursive --depth 1 \
+    && cmake -S /tmp/ceres -B /tmp/ceres/build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_PREFIX_PATH=${CUDSS_ROOT} \
+        -DCMAKE_C_COMPILER=/usr/bin/gcc-10 \
+        -DCMAKE_CXX_COMPILER=/usr/bin/g++-10 \
+        -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-10 \
+        -DUSE_CUDA=ON \
+        -DSUITESPARSE=ON \
+        -DBUILD_SHARED_LIBS=ON \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_EXAMPLES=OFF \
+        -DBUILD_BENCHMARKS=OFF \
+    && cmake --build /tmp/ceres/build --target install --parallel ${MAX_JOBS} \
+    && ldconfig \
+    && test ! -e /usr/local/include/ceres/internal/config.h || ! grep -Eq "^#define[[:space:]]+CERES_NO_CUDA" /usr/local/include/ceres/internal/config.h \
+    && test ! -e /usr/local/include/ceres/internal/config.h || ! grep -Eq "^#define[[:space:]]+CERES_NO_CUDSS" /usr/local/include/ceres/internal/config.h \
+    && rm -rf /tmp/ceres
+
+# Build COLMAP from source with CUDA support and link it against the cuDSS-enabled
+# Ceres installed above. ReSplat only needs the CLI/SfM path, so GUI/MVS/ONNX are
+# disabled to keep the build smaller while preserving CUDA SIFT and GPU BA.
 RUN git clone --depth 1 https://github.com/colmap/colmap.git /tmp/colmap \
     && cmake -S /tmp/colmap -B /tmp/colmap/build -GNinja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCeres_DIR=/usr/local/lib/cmake/Ceres \
+        -Dcudss_DIR=${CUDSS_ROOT}/lib/cmake/cudss \
         -DCMAKE_CUDA_ARCHITECTURES=${COLMAP_CUDA_ARCHITECTURES} \
         -DBLA_VENDOR=OpenBLAS \
         -DCUDA_ENABLED=ON \

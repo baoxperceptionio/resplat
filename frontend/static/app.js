@@ -1,21 +1,15 @@
-import { SplatViewer } from "./viewer.js?v=20260527-colmap-layout";
+import { SplatViewer } from "./viewer.js?v=20260527-batch-loader";
 
 const form = document.querySelector("#jobForm");
 const submitButton = document.querySelector("#submitButton");
-const filesInput = document.querySelector("#files");
-const jobVideoMode = document.querySelector("#jobVideoMode");
-const jobUserVideoField = document.querySelector("#jobUserVideoField");
-const jobUserVideo = document.querySelector("#jobUserVideo");
-const jobUploadProgress = document.querySelector("#jobUploadProgress");
-const sourceTypeSelect = document.querySelector("#sourceType");
-const videoSourceFields = document.querySelector("#videoSourceFields");
-const datasetSourceFields = document.querySelector("#datasetSourceFields");
-const datasetChunkField = document.querySelector("#datasetChunkField");
 const datasetChunkSize = document.querySelector("#datasetChunkSize");
 const colmapDatasetSelect = document.querySelector("#colmapDataset");
+const batchMerge = document.querySelector("#batchMerge");
 const modelSelect = document.querySelector("#model");
 const jobsEl = document.querySelector("#jobs");
 const refreshButton = document.querySelector("#refreshJobs");
+const cpuMetric = document.querySelector("#cpuMetric");
+const gpuMetric = document.querySelector("#gpuMetric");
 const activeTitle = document.querySelector("#activeTitle");
 const activeMeta = document.querySelector("#activeMeta");
 const pipelineToolbar = document.querySelector("#pipelineToolbar");
@@ -60,9 +54,13 @@ let colmapJobs = [];
 let colmapDatasets = [];
 let userVideos = [];
 let activeJobId = null;
+let activeBatchIndex = null;
 let activeColmapJobId = null;
 let viewer = null;
 let loadedPlyUrl = null;
+let loadingPlyUrl = null;
+let loadedCameraKey = null;
+let viewerLoadToken = 0;
 let activeColmapRenderKey = null;
 let activeTab = "colmap";
 let activePanoramaId = null;
@@ -174,21 +172,7 @@ function setVideoMode(modeSelect, fileInput, userField) {
 }
 
 function updateVideoModes() {
-  setVideoMode(jobVideoMode, filesInput, jobUserVideoField);
   setVideoMode(colmapVideoMode, colmapFilesInput, colmapUserVideoField);
-}
-
-function updateSourceMode() {
-  const useDataset = sourceTypeSelect.value === "colmap";
-  videoSourceFields.hidden = useDataset;
-  datasetSourceFields.hidden = !useDataset;
-  datasetChunkField.hidden = !useDataset;
-  filesInput.required = !useDataset && jobVideoMode.value === "upload";
-  document.querySelector("#sampleFps").required = !useDataset;
-  if (useDataset) {
-    datasetChunkSize.value = document.querySelector("#chunkSize").value || "2";
-  }
-  updateVideoModes();
 }
 
 function formatBytes(bytes) {
@@ -196,6 +180,65 @@ function formatBytes(bytes) {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function formatUtilization(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return "--";
+  }
+  return `${Number(value).toFixed(0)}%`;
+}
+
+function formatGpuMetric(gpu) {
+  if (!gpu?.available) {
+    return "--";
+  }
+  const utilization = Number(gpu.utilization);
+  if (!Number.isNaN(utilization) && utilization > 0) {
+    return `${utilization.toFixed(0)}%`;
+  }
+  const memoryPercent = Number(gpu.memory?.percent);
+  if (!Number.isNaN(memoryPercent) && memoryPercent > 0) {
+    return `显存${memoryPercent.toFixed(0)}%`;
+  }
+  return formatUtilization(gpu.utilization);
+}
+
+function formatGpuMetricTitle(gpu) {
+  if (!gpu?.available) {
+    return "GPU metrics unavailable";
+  }
+  const parts = [];
+  const utilization = Number(gpu.utilization);
+  if (!Number.isNaN(utilization)) {
+    parts.push(`compute ${utilization.toFixed(0)}%`);
+  }
+  const usedMb = Number(gpu.memory?.used_mb);
+  const totalMb = Number(gpu.memory?.total_mb);
+  if (!Number.isNaN(usedMb) && !Number.isNaN(totalMb) && totalMb > 0) {
+    parts.push(`VRAM ${(usedMb / 1024).toFixed(1)} / ${(totalMb / 1024).toFixed(1)} GB`);
+  }
+  if (Number(gpu.process_count) > 0) {
+    parts.push(`${gpu.process_count} compute process${Number(gpu.process_count) === 1 ? "" : "es"}`);
+  }
+  return parts.join(" · ") || "GPU idle";
+}
+
+async function refreshSystemMetrics() {
+  try {
+    const response = await fetch("/api/system-metrics", {cache: "no-store"});
+    if (!response.ok) {
+      throw new Error("metrics unavailable");
+    }
+    const metrics = await response.json();
+    cpuMetric.textContent = formatUtilization(metrics.cpu?.utilization);
+    gpuMetric.textContent = formatGpuMetric(metrics.gpu);
+    gpuMetric.parentElement.title = formatGpuMetricTitle(metrics.gpu);
+  } catch (error) {
+    cpuMetric.textContent = "--";
+    gpuMetric.textContent = "--";
+    gpuMetric.parentElement.title = "GPU metrics unavailable";
+  }
 }
 
 function renderUploadProgress(progressEl, files, activeIndex, activeBytes, committedBytes, totalBytes, label) {
@@ -305,12 +348,16 @@ async function uploadFilesInChunks(files, progressEl, label = "上传中") {
 
 function clearPipelineArtifacts(message = "") {
   loadedPlyUrl = null;
+  loadingPlyUrl = null;
+  loadedCameraKey = null;
+  viewerLoadToken += 1;
   setDownload(downloadVideo, null);
   setDownload(downloadPly, null);
   videoPreview.removeAttribute("src");
   videoPreview.load();
   logsEl.textContent = message;
   viewer?.clear();
+  viewerEmpty.textContent = "3DGS viewer";
   viewerEmpty.classList.remove("hidden");
 }
 
@@ -321,48 +368,66 @@ function jobUploadCount(job) {
 function jobSourceMeta(job) {
   if (job.source_type === "colmap") {
     const dataset = job.colmap_dataset;
-    return `COLMAP · ${dataset?.frame_count ?? 0} images`;
+    const mode = job.resplat_mode === "batch_merge" ? "分批合并" : "单次";
+    const batches = job.resplat_mode === "batch_merge" && job.batch_count
+      ? ` · ${job.batch_count} batches`
+      : "";
+    return `COLMAP · ${mode} · ${dataset?.frame_count ?? 0} images${batches}`;
   }
   return `${job.sample_fps} FPS · ${jobUploadCount(job)} video`;
 }
 
+function batchMeta(batch) {
+  const start = Number(batch.start ?? 0);
+  const end = Number(batch.end ?? 0);
+  const coreStart = Number(batch.core_start ?? start);
+  const coreEnd = Number(batch.core_end ?? end);
+  const count = Number(batch.kept_gaussians ?? 0);
+  const countText = count > 0 ? `${(count / 1000).toFixed(0)}k` : "0";
+  const artifacts = [
+    batch.artifacts?.viewer_ply || batch.artifacts?.ply ? "3DGS" : null,
+    batch.artifacts?.video ? "video" : null,
+  ].filter(Boolean).join(" + ");
+  const artifactText = artifacts || "结果生成中";
+  return `${artifactText} · frames ${start}..${Math.max(start, end - 1)} · core ${coreStart}..${Math.max(coreStart, coreEnd - 1)} · ${countText} GS`;
+}
+
+function activeJobSelection(job) {
+  if (activeBatchIndex === null || activeBatchIndex === undefined) {
+    return {
+      title: job.id,
+      meta: `${statusText[job.status] ?? job.status} · ${jobSourceMeta(job)}`,
+      artifacts: job.artifacts,
+    };
+  }
+  const batch = (job.batches ?? []).find((item) => Number(item.index) === Number(activeBatchIndex));
+  if (!batch) {
+    activeBatchIndex = null;
+    return {
+      title: job.id,
+      meta: `${statusText[job.status] ?? job.status} · ${jobSourceMeta(job)}`,
+      artifacts: job.artifacts,
+    };
+  }
+  return {
+    title: `${job.id} · ${batch.label}`,
+    meta: batchMeta(batch),
+    artifacts: batch.artifacts,
+  };
+}
+
 function buildJobFormData(uploadIds = []) {
   const formData = new FormData();
-  const sourceType = sourceTypeSelect.value;
-  formData.set("source_type", sourceType);
-  if (sourceType === "colmap") {
-    if (!colmapDatasetSelect.value) {
-      throw new Error("请先在 COLMAP tab 保存一个 dataset");
-    }
-    formData.set("dataset_id", colmapDatasetSelect.value);
-    formData.set("render_chunk_size", datasetChunkSize.value);
-  } else {
-    if (jobVideoMode.value === "users") {
-      if (!jobUserVideo.value) {
-        throw new Error("请选择 users 目录下的视频");
-      }
-      formData.append("existing_videos", jobUserVideo.value);
-    } else {
-      const selectedFiles = Array.from(filesInput.files ?? []);
-      if (selectedFiles.length === 0) {
-        throw new Error("请至少选择一个视频");
-      }
-      for (const uploadId of uploadIds) {
-        formData.append("upload_ids", uploadId);
-      }
-    }
-    formData.set("sample_fps", document.querySelector("#sampleFps").value);
-    formData.set("render_chunk_size", document.querySelector("#chunkSize").value);
-
-    const startTime = document.querySelector("#startTime").value;
-    const endTime = document.querySelector("#endTime").value;
-    if (startTime) {
-      formData.set("start_time", startTime);
-    }
-    if (endTime) {
-      formData.set("end_time", endTime);
-    }
+  if (uploadIds.length > 0) {
+    throw new Error("视频 pipeline 只能使用已保存的 COLMAP dataset");
   }
+  if (!colmapDatasetSelect.value) {
+    throw new Error("请先在 COLMAP tab 保存一个 dataset");
+  }
+  formData.set("source_type", "colmap");
+  formData.set("dataset_id", colmapDatasetSelect.value);
+  formData.set("render_chunk_size", datasetChunkSize.value);
+  formData.set("resplat_mode", batchMerge.checked ? "batch_merge" : "single");
   formData.set("model_id", modelSelect.value);
   return formData;
 }
@@ -421,9 +486,11 @@ function renderJobs() {
   }
 
   for (const job of jobs) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "job-group";
     const card = document.createElement("button");
     card.type = "button";
-    card.className = `job-card ${job.id === activeJobId ? "active" : ""}`;
+    card.className = `job-card ${job.id === activeJobId && activeBatchIndex === null ? "active" : ""}`;
     card.innerHTML = `
       <div class="job-top">
         <div class="job-id">${job.id}</div>
@@ -432,7 +499,38 @@ function renderJobs() {
       <div class="job-meta">${jobSourceMeta(job)}</div>
     `;
     card.addEventListener("click", () => selectJob(job.id));
-    jobsEl.appendChild(card);
+    wrapper.appendChild(card);
+
+    if (job.id === activeJobId && job.batches?.length) {
+      const batches = document.createElement("div");
+      batches.className = "batch-list";
+
+      if (job.artifacts?.viewer_ply || job.artifacts?.ply || job.artifacts?.video) {
+        const merged = document.createElement("button");
+        merged.type = "button";
+        merged.className = `batch-card ${activeBatchIndex === null ? "active" : ""}`;
+        merged.innerHTML = `
+          <span>合并结果</span>
+          <small>${job.batch_manifest?.merged_gaussians ? `${(job.batch_manifest.merged_gaussians / 1000000).toFixed(2)}M GS` : "merged PLY"}</small>
+        `;
+        merged.addEventListener("click", () => selectJob(job.id));
+        batches.appendChild(merged);
+      }
+
+      for (const batch of job.batches) {
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = `batch-card ${Number(activeBatchIndex) === Number(batch.index) ? "active" : ""}`;
+        item.innerHTML = `
+          <span>${batch.label}</span>
+          <small>${batchMeta(batch)}</small>
+        `;
+        item.addEventListener("click", () => selectBatch(job.id, batch.index));
+        batches.appendChild(item);
+      }
+      wrapper.appendChild(batches);
+    }
+    jobsEl.appendChild(wrapper);
   }
 }
 
@@ -464,12 +562,23 @@ async function loadModels() {
   const response = await fetch("/api/models");
   const data = await response.json();
   modelSelect.innerHTML = "";
+  let preferredOption = null;
+  let firstEnabledOption = null;
   for (const model of data.models) {
     const option = document.createElement("option");
     option.value = model.id;
     option.textContent = `${model.label} · ${model.resolution}`;
     option.disabled = !model.checkpoint_exists;
     modelSelect.appendChild(option);
+    if (model.checkpoint_exists && !firstEnabledOption) {
+      firstEnabledOption = option;
+    }
+    if (model.checkpoint_exists && model.id === "resplat-base-dl3dv-540x960-view16") {
+      preferredOption = option;
+    }
+  }
+  if (preferredOption || firstEnabledOption) {
+    modelSelect.value = (preferredOption || firstEnabledOption).value;
   }
 }
 
@@ -518,12 +627,10 @@ function renderUserVideoOptions(selectEl, currentValue) {
 }
 
 async function loadUserVideos() {
-  const previousJob = jobUserVideo.value;
   const previousColmap = colmapUserVideo.value;
   const response = await fetch("/api/user-videos", {cache: "no-store"});
   const data = await response.json();
   userVideos = data.videos ?? [];
-  renderUserVideoOptions(jobUserVideo, previousJob);
   renderUserVideoOptions(colmapUserVideo, previousColmap);
 }
 
@@ -536,7 +643,11 @@ async function refreshJobs() {
     activeJobId = jobs[0].id;
   } else if (previousActive && !jobs.some((job) => job.id === previousActive)) {
     activeJobId = autoSelectJob ? jobs[0]?.id ?? null : null;
+    activeBatchIndex = null;
+    loadingPlyUrl = null;
     loadedPlyUrl = null;
+    loadedCameraKey = null;
+    viewerLoadToken += 1;
   }
   renderJobs();
   if (activeJobId) {
@@ -566,7 +677,25 @@ async function refreshColmapJobs() {
 async function selectJob(jobId) {
   autoSelectJob = true;
   activeJobId = jobId;
+  activeBatchIndex = null;
+  loadingPlyUrl = null;
   loadedPlyUrl = null;
+  loadedCameraKey = null;
+  viewerLoadToken += 1;
+  viewer?.clear();
+  renderJobs();
+  await refreshActiveJob();
+}
+
+async function selectBatch(jobId, batchIndex) {
+  autoSelectJob = true;
+  activeJobId = jobId;
+  activeBatchIndex = Number(batchIndex);
+  loadingPlyUrl = null;
+  loadedPlyUrl = null;
+  loadedCameraKey = null;
+  viewerLoadToken += 1;
+  viewer?.clear();
   renderJobs();
   await refreshActiveJob();
 }
@@ -590,6 +719,8 @@ function colmapRenderKey(job) {
       candidate.inliers,
       candidate.inlier_ratio,
       candidate.rms_distance,
+      candidate.angle_to_camera_up_deg,
+      candidate.camera_yz_track_angle_deg,
     ]),
   });
 }
@@ -604,12 +735,14 @@ async function refreshActiveJob() {
   }
 
   activeTitle.textContent = job.id;
-  activeMeta.textContent = `${statusText[job.status] ?? job.status} · ${jobSourceMeta(job)}`;
-  setDownload(downloadVideo, job.artifacts.video);
-  setDownload(downloadPly, job.artifacts.ply);
+  const selection = activeJobSelection(job);
+  activeTitle.textContent = selection.title;
+  activeMeta.textContent = selection.meta;
+  setDownload(downloadVideo, selection.artifacts.video);
+  setDownload(downloadPly, selection.artifacts.ply);
 
-  if (job.artifacts.video) {
-    videoPreview.src = job.artifacts.video;
+  if (selection.artifacts.video) {
+    videoPreview.src = selection.artifacts.video;
   } else {
     videoPreview.removeAttribute("src");
     videoPreview.load();
@@ -619,15 +752,47 @@ async function refreshActiveJob() {
   logsEl.textContent = await logsResponse.text();
   logsEl.scrollTop = logsEl.scrollHeight;
 
-  if (job.artifacts.ply && loadedPlyUrl !== job.artifacts.ply) {
+  const viewerPly = selection.artifacts.viewer_ply ?? selection.artifacts.ply;
+  const initialCamera = selection.artifacts.initial_camera ?? null;
+  const initialCameraKey = initialCamera ? JSON.stringify(initialCamera) : null;
+  if (viewerPly && loadedPlyUrl !== viewerPly && loadingPlyUrl !== viewerPly) {
     viewer ??= new SplatViewer(document.querySelector("#viewer"));
-    viewerEmpty.classList.add("hidden");
+    const loadToken = ++viewerLoadToken;
+    loadingPlyUrl = viewerPly;
+    viewerEmpty.textContent = "正在加载 3DGS...";
+    viewerEmpty.classList.remove("hidden");
     try {
-      await viewer.load(job.artifacts.ply);
-      loadedPlyUrl = job.artifacts.ply;
+      const loaded = await viewer.load(viewerPly, { initialCamera });
+      if (loadToken === viewerLoadToken && loaded) {
+        loadedPlyUrl = viewerPly;
+        loadedCameraKey = initialCameraKey;
+        viewerEmpty.classList.add("hidden");
+      }
     } catch (error) {
-      logsEl.textContent += `\n[viewer] ${error.message}\n`;
+      if (loadToken === viewerLoadToken) {
+        loadedPlyUrl = null;
+        loadedCameraKey = null;
+        viewerEmpty.textContent = "3DGS 加载失败";
+        viewerEmpty.classList.remove("hidden");
+        logsEl.textContent += `\n[viewer] ${error.message}\n`;
+      }
+    } finally {
+      if (loadToken === viewerLoadToken) {
+        loadingPlyUrl = null;
+      }
     }
+  } else if (viewerPly && viewer && initialCameraKey && loadedCameraKey !== initialCameraKey) {
+    if (viewer.applyInitialCamera(initialCamera)) {
+      loadedCameraKey = initialCameraKey;
+    }
+  } else if (!viewerPly) {
+    viewer?.clear();
+    loadingPlyUrl = null;
+    loadedPlyUrl = null;
+    loadedCameraKey = null;
+    viewerLoadToken += 1;
+    viewerEmpty.textContent = "暂无 3DGS";
+    viewerEmpty.classList.remove("hidden");
   }
 }
 
@@ -653,13 +818,19 @@ function renderCandidates(job) {
     card.className = `candidate-card ${candidate.id === job.selected_candidate_id ? "selected" : ""}`;
     const ratio = Number(candidate.inlier_ratio ?? 0).toFixed(3);
     const rms = Number(candidate.rms_distance ?? 0).toFixed(4);
+    const angle = candidate.angle_to_camera_up_deg === null || candidate.angle_to_camera_up_deg === undefined
+      ? "n/a"
+      : `${Number(candidate.angle_to_camera_up_deg).toFixed(1)}°`;
+    const track = candidate.camera_yz_track_angle_deg === null || candidate.camera_yz_track_angle_deg === undefined
+      ? "n/a"
+      : `${Number(candidate.camera_yz_track_angle_deg).toFixed(1)}°`;
     card.innerHTML = `
       <img src="${candidate.image_url}" alt="candidate ${candidate.id}" loading="lazy" />
       <div class="job-top">
         <div class="job-id">candidate ${candidate.id}</div>
         <span class="status ${candidate.id === job.selected_candidate_id ? "succeeded" : "queued"}">${candidate.id === job.selected_candidate_id ? "已保存" : "候选"}</span>
       </div>
-      <div class="job-meta">inliers ${candidate.inliers} · ratio ${ratio} · rms ${rms}</div>
+      <div class="job-meta">inliers ${candidate.inliers} · ratio ${ratio} · rms ${rms} · angle ${angle} · track ${track}</div>
       <button type="button">保存为 dataset</button>
     `;
     const button = card.querySelector("button");
@@ -719,21 +890,15 @@ form.addEventListener("submit", async (event) => {
   submitButton.textContent = "启动中";
   autoSelectJob = false;
   activeJobId = null;
+  activeBatchIndex = null;
   renderJobs();
-  const sourceText = sourceTypeSelect.value === "colmap"
-    ? "正在用 COLMAP dataset 创建 ReSplat 任务..."
-    : (
-        jobVideoMode.value === "upload"
-          ? `正在上传 ${filesInput.files?.length ?? 0} 个视频并创建新 pipeline 任务...`
-          : "正在用 users 目录视频创建 pipeline 任务..."
-      );
+  const sourceText = batchMerge.checked
+    ? "正在用 COLMAP dataset 创建分批高清合并任务..."
+    : "正在用 COLMAP dataset 创建 ReSplat 任务...";
   clearPipelineArtifacts(sourceText);
 
   try {
-    const uploadIds = sourceTypeSelect.value === "video" && jobVideoMode.value === "upload"
-      ? await uploadFilesInChunks(Array.from(filesInput.files ?? []), jobUploadProgress, "上传视频")
-      : [];
-    const formData = buildJobFormData(uploadIds);
+    const formData = buildJobFormData();
     const response = await fetch("/api/jobs", {
       method: "POST",
       body: formData,
@@ -744,15 +909,8 @@ form.addEventListener("submit", async (event) => {
     }
     autoSelectJob = true;
     activeJobId = data.job.id;
+    activeBatchIndex = null;
     clearPipelineArtifacts(`任务 ${data.job.id} 已创建，等待结果...`);
-    if (sourceTypeSelect.value === "video") {
-      form.reset();
-      jobUploadProgress.hidden = true;
-      jobUploadProgress.innerHTML = "";
-      document.querySelector("#sampleFps").value = "4";
-      document.querySelector("#chunkSize").value = "2";
-      updateSourceMode();
-    }
     await refreshJobs();
   } catch (error) {
     logsEl.textContent = `[frontend] ${error.message}`;
@@ -765,8 +923,6 @@ form.addEventListener("submit", async (event) => {
 refreshButton.addEventListener("click", refreshJobs);
 refreshColmapButton.addEventListener("click", refreshColmapJobs);
 refreshColmapPreview.addEventListener("click", refreshColmapJobs);
-sourceTypeSelect.addEventListener("change", updateSourceMode);
-jobVideoMode.addEventListener("change", updateSourceMode);
 colmapVideoMode.addEventListener("change", updateVideoModes);
 toggleOutputPane.addEventListener("click", () => {
   setOutputCollapsed(!pipelineWorkspace.classList.contains("viewer-maximized"));
@@ -910,11 +1066,13 @@ seedanceForm.addEventListener("submit", async (event) => {
 await loadModels();
 await loadColmapDatasets();
 await loadUserVideos();
-updateSourceMode();
+updateVideoModes();
 installResizableLayout();
 const params = new URLSearchParams(window.location.search);
 setTab(params.get("tool") || document.body.dataset.tool || "colmap");
+await refreshSystemMetrics();
 await refreshJobs();
 await refreshColmapJobs();
+setInterval(refreshSystemMetrics, 3000);
 setInterval(refreshJobs, 3000);
 setInterval(refreshColmapJobs, 3000);

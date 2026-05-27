@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>ReSplat</title>
-    <link rel="stylesheet" href="/styles.css?v=20260527-colmap-stable-images" />
+    <link rel="stylesheet" href="/styles.css?v=20260527-batch-results" />
     <script type="importmap">
       {
         "imports": {
@@ -25,69 +25,28 @@
 
         <nav class="tabs" aria-label="tools">
           <a class="tab-button active" href="/?tool=colmap" data-tab="colmap" aria-selected="true">COLMAP</a>
-          <a class="tab-button" href="/?tool=pipeline" data-tab="pipeline" aria-selected="false">视频 pipeline</a>
+          <a class="tab-button" href="/?tool=pipeline" data-tab="pipeline" aria-selected="false">ReSplat pipeline</a>
           <a class="tab-button" href="/?tool=panorama" data-tab="panorama" aria-selected="false">全景切图</a>
         </nav>
+
+        <div class="system-metrics" aria-label="system utilization" aria-live="polite">
+          <span class="metric-pill"><span>CPU</span><strong id="cpuMetric">--</strong></span>
+          <span class="metric-pill"><span>GPU</span><strong id="gpuMetric">--</strong></span>
+        </div>
       </header>
 
       <aside class="sidebar">
         <div class="tab-panel" data-panel="pipeline" hidden>
           <form id="jobForm" class="panel">
-            <label>
-              <span>数据源</span>
-              <select id="sourceType" name="source_type">
-                <option value="video">上传新视频</option>
-                <option value="colmap">COLMAP dataset</option>
-              </select>
-            </label>
-
-            <div id="videoSourceFields" class="source-fields">
-              <label>
-                <span>视频来源</span>
-                <select id="jobVideoMode">
-                  <option value="users">users 目录</option>
-                  <option value="upload">本地上传</option>
-                </select>
-              </label>
-
-              <label id="jobUserVideoField">
-                <span>users 视频</span>
-                <select id="jobUserVideo"></select>
-              </label>
-
-              <label>
-                <span>视频</span>
-                <input id="files" name="files" type="file" accept=".mp4,.mov,.m4v,.avi,.mkv,.webm,.mpeg,.mpg,.mts,.m2ts,video/*" multiple required />
-              </label>
-              <div id="jobUploadProgress" class="upload-progress" hidden></div>
-
-              <div class="control-grid">
-                <label>
-                  <span>抽帧 FPS</span>
-                  <input id="sampleFps" name="sample_fps" type="number" min="0.1" max="60" step="0.1" value="4" required />
-                </label>
-                <label>
-                  <span>渲染批量</span>
-                  <input id="chunkSize" name="render_chunk_size" type="number" min="1" max="32" step="1" value="2" required />
-                </label>
-              </div>
-
-              <div class="control-grid">
-                <label>
-                  <span>开始秒</span>
-                  <input id="startTime" name="start_time" type="number" min="0" step="0.1" placeholder="0" />
-                </label>
-                <label>
-                  <span>结束秒</span>
-                  <input id="endTime" name="end_time" type="number" min="0" step="0.1" placeholder="自动" />
-                </label>
-              </div>
-            </div>
-
-            <div id="datasetSourceFields" class="source-fields" hidden>
+            <div id="datasetSourceFields" class="source-fields">
               <label>
                 <span>COLMAP dataset</span>
                 <select id="colmapDataset" name="dataset_id"></select>
+              </label>
+
+              <label class="check-row">
+                <input id="batchMerge" name="batch_merge" type="checkbox" checked />
+                <span>分批高清合并</span>
               </label>
             </div>
 
@@ -96,7 +55,7 @@
               <select id="model" name="model_id" required></select>
             </label>
 
-            <label id="datasetChunkField" hidden>
+            <label id="datasetChunkField">
               <span>渲染批量</span>
               <input id="datasetChunkSize" type="number" min="1" max="32" step="1" value="2" />
             </label>
@@ -343,6 +302,6 @@
       </section>
     </main>
 
-    <script type="module" src="/app.js?v=20260527-colmap-stable-images"></script>
+    <script type="module" src="/app.js?v=20260527-live-batch-results"></script>
   </body>
 </html>
