@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>ReSplat</title>
-    <link rel="stylesheet" href="/styles.css?v=20260523-uploadfix2" />
+    <link rel="stylesheet" href="/styles.css?v=20260527-pipeline-splits" />
     <script type="importmap">
       {
         "imports": {
@@ -15,52 +15,91 @@
       }
     </script>
   </head>
-  <body data-tool="pipeline">
+  <body data-tool="colmap">
     <main class="app-shell">
-      <aside class="sidebar">
+      <header class="topbar">
         <div class="brand">
           <h1>ReSplat</h1>
           <span id="serviceState">ready</span>
         </div>
 
         <nav class="tabs" aria-label="tools">
-          <a class="tab-button active" href="/?tool=pipeline" data-tab="pipeline" aria-selected="true">视频 pipeline</a>
+          <a class="tab-button active" href="/?tool=colmap" data-tab="colmap" aria-selected="true">COLMAP</a>
+          <a class="tab-button" href="/?tool=pipeline" data-tab="pipeline" aria-selected="false">视频 pipeline</a>
           <a class="tab-button" href="/?tool=panorama" data-tab="panorama" aria-selected="false">全景切图</a>
         </nav>
+      </header>
 
-        <div class="tab-panel active" data-panel="pipeline">
+      <aside class="sidebar">
+        <div class="tab-panel" data-panel="pipeline" hidden>
           <form id="jobForm" class="panel">
             <label>
-              <span>视频</span>
-              <input id="files" name="files" type="file" accept=".mp4,.mov,.m4v,.avi,.mkv,.webm,.mpeg,.mpg,.mts,.m2ts,video/*" multiple required />
+              <span>数据源</span>
+              <select id="sourceType" name="source_type">
+                <option value="video">上传新视频</option>
+                <option value="colmap">COLMAP dataset</option>
+              </select>
             </label>
+
+            <div id="videoSourceFields" class="source-fields">
+              <label>
+                <span>视频来源</span>
+                <select id="jobVideoMode">
+                  <option value="users">users 目录</option>
+                  <option value="upload">本地上传</option>
+                </select>
+              </label>
+
+              <label id="jobUserVideoField">
+                <span>users 视频</span>
+                <select id="jobUserVideo"></select>
+              </label>
+
+              <label>
+                <span>视频</span>
+                <input id="files" name="files" type="file" accept=".mp4,.mov,.m4v,.avi,.mkv,.webm,.mpeg,.mpg,.mts,.m2ts,video/*" multiple required />
+              </label>
+              <div id="jobUploadProgress" class="upload-progress" hidden></div>
+
+              <div class="control-grid">
+                <label>
+                  <span>抽帧 FPS</span>
+                  <input id="sampleFps" name="sample_fps" type="number" min="0.1" max="60" step="0.1" value="4" required />
+                </label>
+                <label>
+                  <span>渲染批量</span>
+                  <input id="chunkSize" name="render_chunk_size" type="number" min="1" max="32" step="1" value="2" required />
+                </label>
+              </div>
+
+              <div class="control-grid">
+                <label>
+                  <span>开始秒</span>
+                  <input id="startTime" name="start_time" type="number" min="0" step="0.1" placeholder="0" />
+                </label>
+                <label>
+                  <span>结束秒</span>
+                  <input id="endTime" name="end_time" type="number" min="0" step="0.1" placeholder="自动" />
+                </label>
+              </div>
+            </div>
+
+            <div id="datasetSourceFields" class="source-fields" hidden>
+              <label>
+                <span>COLMAP dataset</span>
+                <select id="colmapDataset" name="dataset_id"></select>
+              </label>
+            </div>
 
             <label>
               <span>模型</span>
               <select id="model" name="model_id" required></select>
             </label>
 
-            <div class="control-grid">
-              <label>
-                <span>抽帧 FPS</span>
-                <input id="sampleFps" name="sample_fps" type="number" min="0.1" max="60" step="0.1" value="4" required />
-              </label>
-              <label>
-                <span>渲染批量</span>
-                <input id="chunkSize" name="render_chunk_size" type="number" min="1" max="32" step="1" value="2" required />
-              </label>
-            </div>
-
-            <div class="control-grid">
-              <label>
-                <span>开始秒</span>
-                <input id="startTime" name="start_time" type="number" min="0" step="0.1" placeholder="0" />
-              </label>
-              <label>
-                <span>结束秒</span>
-                <input id="endTime" name="end_time" type="number" min="0" step="0.1" placeholder="自动" />
-              </label>
-            </div>
+            <label id="datasetChunkField" hidden>
+              <span>渲染批量</span>
+              <input id="datasetChunkSize" type="number" min="1" max="32" step="1" value="2" />
+            </label>
 
             <button id="submitButton" type="submit">启动 pipeline</button>
           </form>
@@ -71,6 +110,90 @@
               <button id="refreshJobs" class="icon-button" type="button" title="刷新">↻</button>
             </div>
             <div id="jobs" class="jobs"></div>
+          </section>
+        </div>
+
+        <div class="tab-panel active" data-panel="colmap">
+          <form id="colmapForm" class="panel">
+            <div class="panel-group">
+              <div class="panel-title">Input</div>
+              <label>
+                <span>视频来源</span>
+                <select id="colmapVideoMode">
+                  <option value="users">users 目录</option>
+                  <option value="upload">本地上传</option>
+                </select>
+              </label>
+
+              <label id="colmapUserVideoField">
+                <span>users 视频</span>
+                <select id="colmapUserVideo"></select>
+              </label>
+
+              <label>
+                <span>视频</span>
+                <input id="colmapFiles" name="files" type="file" accept=".mp4,.mov,.m4v,.avi,.mkv,.webm,.mpeg,.mpg,.mts,.m2ts,video/*" multiple required />
+              </label>
+              <div id="colmapUploadProgress" class="upload-progress" hidden></div>
+            </div>
+
+            <div class="panel-group">
+              <div class="panel-title">COLMAP</div>
+              <div class="control-grid">
+                <label>
+                  <span>抽帧 FPS</span>
+                  <input name="sample_fps" type="number" min="0.1" max="60" step="0.1" value="4" required />
+                </label>
+                <label>
+                  <span>匹配器</span>
+                  <select name="matcher">
+                    <option value="auto">auto</option>
+                    <option value="sequential">sequential</option>
+                    <option value="exhaustive">exhaustive</option>
+                  </select>
+                </label>
+              </div>
+
+              <div class="control-grid">
+                <label>
+                  <span>开始秒</span>
+                  <input name="start_time" type="number" min="0" step="0.1" placeholder="0" />
+                </label>
+                <label>
+                  <span>结束秒</span>
+                  <input name="end_time" type="number" min="0" step="0.1" placeholder="自动" />
+                </label>
+              </div>
+
+              <div class="control-grid">
+                <label>
+                  <span>候选数</span>
+                  <input name="num_candidates" type="number" min="1" max="16" step="1" value="8" />
+                </label>
+                <label>
+                  <span>RANSAC</span>
+                  <input name="ransac_iterations" type="number" min="100" max="100000" step="100" value="12000" />
+                </label>
+              </div>
+
+              <label>
+                <span>COLMAP GPU</span>
+                <select name="colmap_use_gpu">
+                  <option value="1">on</option>
+                  <option value="0">off</option>
+                </select>
+              </label>
+            </div>
+
+            <button id="colmapButton" type="submit">启动 COLMAP</button>
+          </form>
+
+          <section class="jobs-section">
+            <div class="section-head">
+              <h2>COLMAP</h2>
+              <button id="refreshColmapJobs" class="icon-button" type="button" title="刷新">↻</button>
+            </div>
+            <div id="colmapJobs" class="jobs"></div>
           </section>
         </div>
 
@@ -164,7 +287,7 @@
       </aside>
 
       <section class="workspace">
-        <div class="toolbar">
+        <div class="toolbar" id="pipelineToolbar">
           <div>
             <p id="activeTitle">等待任务</p>
             <span id="activeMeta">上传视频后会在这里显示产物</span>
@@ -176,18 +299,17 @@
           </div>
         </div>
 
-        <div id="pipelineWorkspace" class="workspace-view active" style="--output-height: 180px;">
-          <div class="viewer-wrap">
-            <div id="viewer"></div>
-            <div id="viewerEmpty" class="empty-state">3DGS viewer</div>
-            <div id="viewerResize" class="viewer-resize-grip" title="拖拽调整 3DGS viewer 高度"></div>
-          </div>
-
-          <div class="output-pane">
+        <div id="pipelineWorkspace" class="workspace-view active">
+          <div class="pipeline-preview">
+            <div class="viewer-wrap">
+              <div id="viewer"></div>
+              <div id="viewerEmpty" class="empty-state">3DGS viewer</div>
+              <div id="viewerResize" class="viewer-resize-grip" title="拖拽调整 video 预览高度"></div>
+            </div>
             <video id="videoPreview" controls playsinline></video>
-            <div id="outputResize" class="resize-handle col-resize" title="拖拽调整 video/log 宽度"></div>
-            <pre id="logs"></pre>
           </div>
+          <div id="outputResize" class="resize-handle col-resize" title="拖拽调整 log 面板宽度"></div>
+          <pre id="logs"></pre>
         </div>
 
         <div id="panoramaWorkspace" class="workspace-view panorama-view" hidden>
@@ -202,9 +324,25 @@
             <div class="empty-inline">等待全景图</div>
           </div>
         </div>
+
+        <div id="colmapWorkspace" class="workspace-view colmap-view" hidden>
+          <div class="colmap-actions">
+            <div>
+              <p id="colmapTitle">COLMAP</p>
+              <span id="colmapMeta">生成地面候选后选择一个保存为 dataset</span>
+            </div>
+            <button id="refreshColmapPreview" class="button ghost" type="button">刷新</button>
+          </div>
+          <div class="colmap-body">
+            <div id="candidateGallery" class="candidate-gallery">
+              <div class="empty-inline">等待 COLMAP 任务</div>
+            </div>
+            <pre id="colmapLogs"></pre>
+          </div>
+        </div>
       </section>
     </main>
 
-    <script type="module" src="/app.js?v=20260523-uploadfix2"></script>
+    <script type="module" src="/app.js?v=20260527-pipeline-splits"></script>
   </body>
 </html>

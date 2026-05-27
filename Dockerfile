@@ -109,17 +109,9 @@ RUN python -m pip install \
 COPY requirements.txt ./requirements.txt
 RUN python -m pip install -r requirements.txt
 
-# ReSplat uses gsplat and pointops CUDA extensions. Build them against the
-# PyTorch/CUDA stack baked into this image so the bind-mounted source can stay
-# lightweight at runtime.
+# ReSplat uses gsplat as an external CUDA dependency, so keep that dependency in
+# the environment image. Local project code is bind-mounted at runtime.
 RUN python -m pip install --no-build-isolation \
         "git+https://github.com/nerfstudio-project/gsplat.git@v1.5.3"
-
-COPY src/model/encoder/pointops ./src/model/encoder/pointops
-RUN cd src/model/encoder/pointops \
-    && python setup.py install \
-    && cd /workspace/resplat
-
-COPY . .
 
 CMD ["bash", "-lc", "if [ -n \"${RESPLAT_CMD:-}\" ]; then exec bash -lc \"${RESPLAT_CMD}\"; else exec sleep infinity; fi"]

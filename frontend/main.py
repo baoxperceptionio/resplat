@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import threading
 import time
@@ -23,6 +24,7 @@ from PIL import Image
 
 REPO_ROOT = Path(os.getenv("RESPLAT_REPO", "/workspace/resplat")).resolve()
 JOB_ROOT = Path(os.getenv("FRONTEND_JOB_ROOT", REPO_ROOT / "users" / "webui-jobs")).resolve()
+UPLOAD_ROOT = JOB_ROOT / "uploads"
 RESPLAT_CONTAINER = os.getenv("RESPLAT_CONTAINER", "resplat")
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "1")))
 STATE_PATH = JOB_ROOT / "jobs.json"
@@ -42,6 +44,17 @@ VIDEO_EXTENSIONS = {
 }
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
 ALLOWED_DOWNLOADS = {"video.mp4", "gaussians.ply"}
+COLMAP_ALLOWED_FILES = {"overview_zy.png"}
+
+PRESET_SHAPES = {
+    "dl3dv_8v_512x960": (512, 960),
+    "dl3dv_16v_540x960": (540, 960),
+    "dl3dv_8v_256x448": (256, 448),
+    "dl3dv_16v_256x448": (256, 448),
+    "dl3dv_32v_256x448": (256, 448),
+    "dl3dv_8v_256x448_small": (256, 448),
+    "dl3dv_8v_256x448_large": (256, 448),
+}
 
 MODEL_OPTIONS: list[dict[str, Any]] = [
     {
@@ -99,11 +112,14 @@ def safe_slug(value: str) -> str:
 
 def load_state() -> dict[str, Any]:
     if not STATE_PATH.exists():
-        return {"jobs": {}}
+        return {"jobs": {}, "colmap_jobs": {}}
     try:
-        return json.loads(STATE_PATH.read_text())
+        state = json.loads(STATE_PATH.read_text())
     except json.JSONDecodeError:
-        return {"jobs": {}}
+        state = {}
+    state.setdefault("jobs", {})
+    state.setdefault("colmap_jobs", {})
+    return state
 
 
 def save_state(state: dict[str, Any]) -> None:
@@ -125,6 +141,18 @@ def update_job(job_id: str, **updates: Any) -> dict[str, Any]:
         return job
 
 
+def update_colmap_job(job_id: str, **updates: Any) -> dict[str, Any]:
+    with state_lock:
+        state = load_state()
+        job = state["colmap_jobs"].get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        job.update(updates)
+        job["updated_at"] = utc_now()
+        save_state(state)
+        return job
+
+
 def append_log(job_id: str, text: str) -> None:
     log_path = job_dir(job_id) / "run.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -132,8 +160,32 @@ def append_log(job_id: str, text: str) -> None:
         handle.write(text)
 
 
+def append_colmap_log(job_id: str, text: str) -> None:
+    log_path = colmap_job_dir(job_id) / "run.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8", errors="replace") as handle:
+        handle.write(text)
+
+
 def job_dir(job_id: str) -> Path:
     return JOB_ROOT / job_id
+
+
+def colmap_job_dir(job_id: str) -> Path:
+    return JOB_ROOT / "colmap" / job_id
+
+
+def container_path(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        rel = resolved.relative_to(REPO_ROOT)
+        return f"/workspace/resplat/{rel.as_posix()}"
+    except ValueError:
+        try:
+            rel = resolved.relative_to(JOB_ROOT)
+            return f"/workspace/resplat/users/webui-jobs/{rel.as_posix()}"
+        except ValueError:
+            return str(resolved)
 
 
 def reset_job_workspace(root: Path) -> tuple[Path, Path, Path]:
@@ -146,6 +198,18 @@ def reset_job_workspace(root: Path) -> tuple[Path, Path, Path]:
     work.mkdir(parents=True, exist_ok=False)
     results.mkdir(parents=True, exist_ok=False)
     return raw_videos, work, results
+
+
+def reset_colmap_workspace(root: Path) -> tuple[Path, Path, Path]:
+    if root.exists():
+        shutil.rmtree(root)
+    raw_videos = root / "raw_videos"
+    work = root / "work"
+    proposals = root / "ground_proposals"
+    raw_videos.mkdir(parents=True, exist_ok=False)
+    work.mkdir(parents=True, exist_ok=False)
+    proposals.mkdir(parents=True, exist_ok=False)
+    return raw_videos, work, proposals
 
 
 def job_public(job: dict[str, Any]) -> dict[str, Any]:
@@ -170,41 +234,76 @@ def job_public(job: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
+def colmap_public(job: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(job)
+    proposals_path = Path(job["paths"]["proposals"]) / "ground_proposals.json"
+    candidates = []
+    if proposals_path.exists():
+        try:
+            proposals = json.loads(proposals_path.read_text())
+            for item in proposals.get("candidates", []):
+                image = item.get("image")
+                candidates.append(
+                    {
+                        "id": item.get("id"),
+                        "image": image,
+                        "image_url": f"/api/colmap-jobs/{job['id']}/files/{image}" if image else None,
+                        "inliers": item.get("inliers"),
+                        "inlier_ratio": item.get("inlier_ratio"),
+                        "rms_distance": item.get("rms_distance"),
+                    }
+                )
+        except Exception:
+            candidates = []
+    enriched["candidates"] = candidates
+    enriched["overview_url"] = (
+        f"/api/colmap-jobs/{job['id']}/files/overview_zy.png"
+        if (Path(job["paths"]["proposals"]) / "overview_zy.png").exists()
+        else None
+    )
+    enriched["dataset_ready"] = bool(job.get("aligned_scene"))
+    return enriched
+
+
 def model_public(model: dict[str, Any]) -> dict[str, Any]:
     item = dict(model)
     item["checkpoint_exists"] = (REPO_ROOT / model["checkpoint"]).exists()
     return item
 
 
-def render_index(tool: str) -> str:
-    tool = tool if tool in {"pipeline", "panorama"} else "pipeline"
-    html = (Path(__file__).parent / "static" / "index.html").read_text()
-    if tool == "pipeline":
-        return html
-
-    replacements = {
-        '<body data-tool="pipeline">': '<body data-tool="panorama">',
-        '<a class="tab-button active" href="/?tool=pipeline" data-tab="pipeline" aria-selected="true">视频 pipeline</a>':
-            '<a class="tab-button" href="/?tool=pipeline" data-tab="pipeline" aria-selected="false">视频 pipeline</a>',
-        '<a class="tab-button" href="/?tool=panorama" data-tab="panorama" aria-selected="false">全景切图</a>':
-            '<a class="tab-button active" href="/?tool=panorama" data-tab="panorama" aria-selected="true">全景切图</a>',
-        '<div class="tab-panel active" data-panel="pipeline">':
-            '<div class="tab-panel" data-panel="pipeline" hidden>',
-        '<div class="tab-panel" data-panel="panorama" hidden>':
-            '<div class="tab-panel active" data-panel="panorama">',
-        '<div class="actions">': '<div class="actions" hidden>',
-        '<div id="pipelineWorkspace" class="workspace-view active">':
-            '<div id="pipelineWorkspace" class="workspace-view" hidden>',
-        '<div id="panoramaWorkspace" class="workspace-view panorama-view" hidden>':
-            '<div id="panoramaWorkspace" class="workspace-view panorama-view active">',
-        '<p id="activeTitle">等待任务</p>':
-            '<p id="activeTitle">全景切图</p>',
-        '<span id="activeMeta">上传视频后会在这里显示产物</span>':
-            '<span id="activeMeta">60 度水平视角，起点每 20 度生成一张</span>',
+def colmap_dataset_public(job: dict[str, Any]) -> dict[str, Any] | None:
+    aligned_scene = job.get("aligned_scene")
+    if not aligned_scene:
+        return None
+    scene_path = Path(aligned_scene)
+    if not scene_path.exists():
+        return None
+    return {
+        "id": job["id"],
+        "label": f"{job['id']} · candidate {job.get('selected_candidate_id')}",
+        "frame_count": job.get("frame_count", 0),
+        "candidate_id": job.get("selected_candidate_id"),
+        "scene": str(scene_path),
+        "scene_container": job.get("aligned_scene_container") or container_path(scene_path),
+        "sparse_dir": job.get("aligned_sparse_dir", "sparse"),
     }
-    for before, after in replacements.items():
-        html = html.replace(before, after)
-    return html
+
+
+def get_colmap_dataset(dataset_id: str) -> dict[str, Any]:
+    with state_lock:
+        job = load_state()["colmap_jobs"].get(dataset_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="COLMAP dataset not found")
+    dataset = colmap_dataset_public(job)
+    if dataset is None:
+        raise HTTPException(status_code=400, detail="COLMAP dataset is not ready")
+    return dataset
+
+
+def render_index(tool: str) -> str:
+    tool = tool if tool in {"colmap", "pipeline", "panorama"} else "colmap"
+    html = (Path(__file__).parent / "static" / "index.html").read_text()
+    return html.replace('<body data-tool="pipeline">', f'<body data-tool="{tool}">')
 
 
 def perspective_from_equirectangular(
@@ -298,6 +397,152 @@ def form_uploads(form: Any) -> list[Any]:
     return [item for item in uploads if hasattr(item, "filename") and hasattr(item, "read")]
 
 
+def form_upload_ids(form: Any) -> list[str]:
+    upload_ids: list[str] = []
+    for field in ("upload_ids", "upload_ids[]"):
+        upload_ids.extend(str(value) for value in form.getlist(field) if str(value).strip())
+    return upload_ids
+
+
+def form_existing_videos(form: Any) -> list[str]:
+    videos: list[str] = []
+    for field in ("existing_videos", "existing_videos[]", "existing_video"):
+        videos.extend(str(value) for value in form.getlist(field) if str(value).strip())
+    return videos
+
+
+def users_root() -> Path:
+    return REPO_ROOT / "users"
+
+
+def resolve_user_video(relative_path: str) -> Path:
+    if relative_path.startswith("/") or "\x00" in relative_path:
+        raise HTTPException(status_code=400, detail="Invalid users video path")
+    root = users_root().resolve()
+    path = (root / relative_path).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid users video path") from exc
+    if not path.exists() or not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+        raise HTTPException(status_code=404, detail="Users video not found")
+    return path
+
+
+def upload_dir(upload_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+        raise HTTPException(status_code=400, detail="Invalid upload id")
+    return UPLOAD_ROOT / upload_id
+
+
+def upload_meta(upload_id: str) -> dict[str, Any]:
+    meta_path = upload_dir(upload_id) / "meta.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="Upload not found")
+    return json.loads(meta_path.read_text())
+
+
+def staged_upload_plan(upload_ids: list[str], start_index: int = 0) -> list[dict[str, Any]]:
+    plan = []
+    for offset, upload_id in enumerate(upload_ids):
+        meta = upload_meta(upload_id)
+        if meta.get("status") != "complete":
+            raise HTTPException(status_code=400, detail=f"Upload {upload_id} is not complete")
+        source_path = Path(meta["path"])
+        if not source_path.exists():
+            raise HTTPException(status_code=404, detail=f"Uploaded file missing: {upload_id}")
+        filename = normalized_video_filename(type("UploadRef", (), {"filename": meta["filename"], "content_type": "video/*"})(), offset)
+        plan.append(
+            {
+                "index": start_index + offset,
+                "upload": None,
+                "source_path": source_path,
+                "filename": filename,
+                "original_name": meta["filename"],
+                "bytes": int(meta.get("total_size") or source_path.stat().st_size),
+                "upload_id": upload_id,
+                "source_action": "move",
+            }
+        )
+    return plan
+
+
+def existing_video_plan(relative_paths: list[str], start_index: int = 0) -> list[dict[str, Any]]:
+    plan = []
+    for offset, relative_path in enumerate(relative_paths):
+        source_path = resolve_user_video(relative_path)
+        filename = normalized_video_filename(
+            type("UploadRef", (), {"filename": source_path.name, "content_type": "video/*"})(),
+            offset,
+        )
+        plan.append(
+            {
+                "index": start_index + offset,
+                "upload": None,
+                "source_path": source_path,
+                "filename": filename,
+                "original_name": relative_path,
+                "bytes": source_path.stat().st_size,
+                "upload_id": None,
+                "source_action": "symlink",
+            }
+        )
+    return plan
+
+
+def direct_upload_plan(files: list[Any], start_index: int = 0) -> list[dict[str, Any]]:
+    plan = []
+    for offset, upload in enumerate(files):
+        filename = normalized_video_filename(upload, offset)
+        plan.append(
+            {
+                "index": start_index + offset,
+                "upload": upload,
+                "source_path": None,
+                "filename": filename,
+                "original_name": upload.filename,
+                "bytes": None,
+                "upload_id": None,
+                "source_action": "direct",
+            }
+        )
+    return plan
+
+
+async def materialize_upload_plan(upload_plan: list[dict[str, Any]], raw_videos: Path) -> tuple[list[str], list[dict[str, Any]]]:
+    uploaded_names = []
+    source_manifest = []
+    for item in upload_plan:
+        target = raw_videos / f"{item['index']:03d}-{item['filename']}"
+        bytes_written = 0
+        if item["upload"] is not None:
+            with target.open("wb") as handle:
+                while chunk := await item["upload"].read(1024 * 1024):
+                    bytes_written += len(chunk)
+                    handle.write(chunk)
+        else:
+            source_path = Path(item["source_path"])
+            bytes_written = int(item["bytes"])
+            if item.get("source_action") == "symlink":
+                target.symlink_to(source_path)
+            else:
+                shutil.move(str(source_path), target)
+                shutil.rmtree(source_path.parent.parent, ignore_errors=True)
+
+        uploaded_names.append(target.name)
+        source_manifest.append(
+            {
+                "index": item["index"],
+                "original_name": item["original_name"],
+                "stored_name": target.name,
+                "bytes": bytes_written,
+                "upload_id": item.get("upload_id"),
+                "source": item.get("source_action"),
+            }
+        )
+    return uploaded_names, source_manifest
+
+
 def log_job_request(message: str) -> None:
     print(f"[frontend:/api/jobs] {message}", flush=True)
 
@@ -325,29 +570,70 @@ def run_resplat_job(job_id: str) -> None:
     with run_semaphore:
         job = update_job(job_id, status="running", started_at=utc_now())
         model = MODELS_BY_ID[job["model_id"]]
+        if job.get("source_type") == "colmap":
+            dataset = job["colmap_dataset"]
+            frame_count = max(1, int(dataset.get("frame_count") or 1))
+            command = [
+                "python",
+                "scripts/infer_colmap.py",
+                "--model_preset",
+                model["preset"],
+                "--scene_path",
+                dataset["scene_container"],
+                "--start_frame",
+                "0",
+                "--frame_distance",
+                str(frame_count),
+                "--images_dir",
+                "images",
+                "--sparse_dir",
+                dataset.get("sparse_dir", "sparse"),
+                "--output_dir",
+                job["paths"]["results_container"],
+                "--target_selection",
+                "all",
+                "--save_images",
+                "--save_video",
+                "--save_ply",
+                "--render_chunk_size",
+                str(job["render_chunk_size"]),
+                "--no_eval",
+            ]
+            if frame_count < int(model["views"]):
+                command.extend(["--num_context", str(frame_count)])
+            shape = PRESET_SHAPES.get(model["preset"])
+            if shape is not None:
+                command.extend(["--image_shape", str(shape[0]), str(shape[1])])
+        else:
+            command = [
+                "python",
+                "scripts/video_to_resplat.py",
+                "--video",
+                job["paths"]["uploads_container"],
+                "--sample_fps",
+                str(job["sample_fps"]),
+                "--work_dir",
+                job["paths"]["work_container"],
+                "--output_dir",
+                job["paths"]["results_container"],
+                "--scene_name",
+                job_id,
+                "--model_preset",
+                model["preset"],
+                "--render_chunk_size",
+                str(job["render_chunk_size"]),
+                "--overwrite",
+            ]
+            if job.get("start_time") is not None:
+                command.extend(["--start_time", str(job["start_time"])])
+            if job.get("end_time") is not None:
+                command.extend(["--end_time", str(job["end_time"])])
+
         command = [
-            "python",
-            "scripts/video_to_resplat.py",
-            "--video",
-            job["paths"]["uploads_container"],
-            "--sample_fps",
-            str(job["sample_fps"]),
-            "--work_dir",
-            job["paths"]["work_container"],
-            "--output_dir",
-            job["paths"]["results_container"],
-            "--scene_name",
-            job_id,
-            "--model_preset",
-            model["preset"],
-            "--render_chunk_size",
-            str(job["render_chunk_size"]),
-            "--overwrite",
+            "bash",
+            "-lc",
+            "scripts/ensure_pointops.sh && " + shlex.join(command),
         ]
-        if job.get("start_time") is not None:
-            command.extend(["--start_time", str(job["start_time"])])
-        if job.get("end_time") is not None:
-            command.extend(["--end_time", str(job["end_time"])])
 
         append_log(job_id, "$ " + " ".join(command) + "\n")
         try:
@@ -383,16 +669,129 @@ def run_resplat_job(job_id: str) -> None:
             )
 
 
+def docker_exec_stream(command: list[str], log_fn, workdir: Path = REPO_ROOT) -> int:
+    client = docker.from_env()
+    container = client.containers.get(RESPLAT_CONTAINER)
+    exec_id = client.api.exec_create(
+        container.id,
+        command,
+        workdir=str(workdir),
+    )["Id"]
+    for chunk in client.api.exec_start(exec_id, stream=True):
+        log_fn(chunk.decode("utf-8", errors="replace"))
+    result = client.api.exec_inspect(exec_id)
+    return int(result.get("ExitCode", 1))
+
+
+def run_colmap_job(job_id: str) -> None:
+    with run_semaphore:
+        job = update_colmap_job(job_id, status="running", started_at=utc_now())
+        scene_host = Path(job["paths"]["scene"])
+        proposals_host = Path(job["paths"]["proposals"])
+        colmap_command = [
+            "python",
+            "scripts/video_to_resplat.py",
+            "--video",
+            job["paths"]["uploads_container"],
+            "--sample_fps",
+            str(job["sample_fps"]),
+            "--work_dir",
+            job["paths"]["work_container"],
+            "--scene_name",
+            job_id,
+            "--skip_resplat",
+            "--matcher",
+            job["matcher"],
+            "--colmap_use_gpu",
+            str(job["colmap_use_gpu"]),
+            "--overwrite",
+        ]
+        if job.get("start_time") is not None:
+            colmap_command.extend(["--start_time", str(job["start_time"])])
+        if job.get("end_time") is not None:
+            colmap_command.extend(["--end_time", str(job["end_time"])])
+
+        propose_command = [
+            "python",
+            "scripts/align_colmap_ground.py",
+            "propose",
+            "--scene_path",
+            job["paths"]["scene_container"],
+            "--output_dir",
+            job["paths"]["proposals_container"],
+            "--num_candidates",
+            str(job["num_candidates"]),
+            "--iterations",
+            str(job["ransac_iterations"]),
+        ]
+
+        def log(text: str) -> None:
+            append_colmap_log(job_id, text)
+
+        try:
+            append_colmap_log(job_id, "$ " + " ".join(colmap_command) + "\n")
+            exit_code = docker_exec_stream(colmap_command, log)
+            if exit_code != 0:
+                update_colmap_job(
+                    job_id,
+                    status="failed",
+                    finished_at=utc_now(),
+                    exit_code=exit_code,
+                    error=f"COLMAP exited with code {exit_code}",
+                )
+                return
+
+            frame_count = len(list((scene_host / "images").glob("*")))
+            update_colmap_job(job_id, frame_count=frame_count)
+
+            append_colmap_log(job_id, "\n$ " + " ".join(propose_command) + "\n")
+            exit_code = docker_exec_stream(propose_command, log)
+            if exit_code != 0:
+                update_colmap_job(
+                    job_id,
+                    status="failed",
+                    finished_at=utc_now(),
+                    exit_code=exit_code,
+                    error=f"Ground proposal exited with code {exit_code}",
+                )
+                return
+
+            update_colmap_job(
+                job_id,
+                status="proposed",
+                finished_at=utc_now(),
+                exit_code=0,
+                frame_count=frame_count,
+                proposal_count=len(list(proposals_host.glob("candidate_*_zy.png"))),
+            )
+        except Exception as exc:
+            append_colmap_log(job_id, f"\n[frontend] {type(exc).__name__}: {exc}\n")
+            update_colmap_job(
+                job_id,
+                status="failed",
+                finished_at=utc_now(),
+                exit_code=None,
+                error=str(exc),
+            )
+
+
 @app.on_event("startup")
 def prepare_storage() -> None:
     JOB_ROOT.mkdir(parents=True, exist_ok=True)
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     PANORAMA_ROOT.mkdir(parents=True, exist_ok=True)
+    (JOB_ROOT / "colmap").mkdir(parents=True, exist_ok=True)
     with state_lock:
         state = load_state()
         for job in state.get("jobs", {}).values():
             if job.get("status") in {"queued", "running"}:
                 job["status"] = "interrupted"
                 job["error"] = "Frontend restarted while this job was active."
+                job["updated_at"] = utc_now()
+        for job in state.get("colmap_jobs", {}).values():
+            if job.get("status") in {"queued", "running"}:
+                job["status"] = "interrupted"
+                job["error"] = "Frontend restarted while this COLMAP job was active."
                 job["updated_at"] = utc_now()
         save_state(state)
 
@@ -403,7 +802,7 @@ def list_models() -> dict[str, Any]:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(tool: str = "pipeline") -> HTMLResponse:
+def index(tool: str = "colmap") -> HTMLResponse:
     return HTMLResponse(
         render_index(tool),
         headers={"Cache-Control": "no-store, max-age=0"},
@@ -416,6 +815,122 @@ def list_jobs() -> dict[str, Any]:
         jobs = list(load_state()["jobs"].values())
     jobs.sort(key=lambda item: item.get("created_at", ""), reverse=True)
     return {"jobs": [job_public(job) for job in jobs]}
+
+
+@app.get("/api/colmap-jobs")
+def list_colmap_jobs() -> dict[str, Any]:
+    with state_lock:
+        jobs = list(load_state()["colmap_jobs"].values())
+    jobs.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return {"jobs": [colmap_public(job) for job in jobs]}
+
+
+@app.get("/api/colmap-datasets")
+def list_colmap_datasets() -> dict[str, Any]:
+    with state_lock:
+        jobs = list(load_state()["colmap_jobs"].values())
+    datasets = [dataset for job in jobs if (dataset := colmap_dataset_public(job))]
+    datasets.sort(key=lambda item: item["id"], reverse=True)
+    return {"datasets": datasets}
+
+
+@app.get("/api/user-videos")
+def list_user_videos() -> dict[str, Any]:
+    root = users_root()
+    videos = []
+    if root.exists():
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+                continue
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if relative.startswith("webui-jobs/"):
+                continue
+            stat = path.stat()
+            videos.append(
+                {
+                    "path": relative,
+                    "name": path.name,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                }
+            )
+    return {"videos": videos}
+
+
+@app.post("/api/uploads/init")
+async def init_upload(request: Request) -> dict[str, Any]:
+    payload = await request.json()
+    filename = safe_slug(str(payload.get("filename") or "upload.bin"))
+    total_size = int(payload.get("total_size") or 0)
+    total_chunks = int(payload.get("total_chunks") or 0)
+    if total_size <= 0:
+        raise HTTPException(status_code=400, detail="total_size must be positive")
+    if total_chunks <= 0 or total_chunks > 100000:
+        raise HTTPException(status_code=400, detail="Invalid chunk count")
+
+    upload_id = uuid.uuid4().hex
+    root = upload_dir(upload_id)
+    chunks = root / "chunks"
+    chunks.mkdir(parents=True, exist_ok=False)
+    meta = {
+        "id": upload_id,
+        "filename": filename,
+        "original_filename": payload.get("filename"),
+        "total_size": total_size,
+        "total_chunks": total_chunks,
+        "created_at": utc_now(),
+        "status": "uploading",
+    }
+    (root / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return {"upload_id": upload_id}
+
+
+@app.post("/api/uploads/{upload_id}/chunks")
+async def upload_chunk(upload_id: str, request: Request, index: int) -> dict[str, Any]:
+    meta = upload_meta(upload_id)
+    if meta.get("status") not in {"uploading", "complete"}:
+        raise HTTPException(status_code=400, detail="Upload is not writable")
+    if index < 0 or index >= int(meta["total_chunks"]):
+        raise HTTPException(status_code=400, detail="Chunk index out of range")
+
+    chunk_path = upload_dir(upload_id) / "chunks" / f"{index:08d}.part"
+    tmp_path = chunk_path.with_suffix(".tmp")
+    data = await request.body()
+    with tmp_path.open("wb") as handle:
+        handle.write(data)
+    tmp_path.replace(chunk_path)
+    return {"upload_id": upload_id, "index": index, "bytes": len(data)}
+
+
+@app.post("/api/uploads/{upload_id}/complete")
+def complete_upload(upload_id: str) -> dict[str, Any]:
+    meta = upload_meta(upload_id)
+    root = upload_dir(upload_id)
+    chunks = root / "chunks"
+    complete_dir = root / "complete"
+    complete_dir.mkdir(exist_ok=True)
+    output_path = complete_dir / meta["filename"]
+
+    with output_path.open("wb") as output:
+        for index in range(int(meta["total_chunks"])):
+            chunk_path = chunks / f"{index:08d}.part"
+            if not chunk_path.exists():
+                raise HTTPException(status_code=400, detail=f"Missing chunk {index}")
+            with chunk_path.open("rb") as handle:
+                shutil.copyfileobj(handle, output)
+
+    size = output_path.stat().st_size
+    if size != int(meta["total_size"]):
+        output_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Upload size mismatch")
+
+    meta.update({"status": "complete", "path": str(output_path), "completed_at": utc_now()})
+    (root / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    shutil.rmtree(chunks, ignore_errors=True)
+    return {"upload_id": upload_id, "filename": meta["filename"], "bytes": size}
 
 
 @app.post("/api/panorama")
@@ -497,6 +1012,111 @@ async def create_panorama(
     }
 
 
+@app.post("/api/colmap-jobs")
+async def create_colmap_job(request: Request) -> dict[str, Any]:
+    try:
+        form = await request.form(max_files=250, max_fields=100)
+    except Exception:
+        raise
+    files = form_uploads(form)
+    upload_ids = form_upload_ids(form)
+    existing_videos = form_existing_videos(form)
+    sample_fps = form_float(form, "sample_fps")
+    start_time = form_float(form, "start_time", None)
+    end_time = form_float(form, "end_time", None)
+    matcher = form_string(form, "matcher", "auto")
+    colmap_use_gpu = form_int(form, "colmap_use_gpu", 1)
+    num_candidates = form_int(form, "num_candidates", 8)
+    ransac_iterations = form_int(form, "ransac_iterations", 12000)
+
+    if not files and not upload_ids and not existing_videos:
+        raise HTTPException(status_code=400, detail="Select or upload at least one video")
+    if sample_fps is None or sample_fps <= 0 or sample_fps > 60:
+        raise HTTPException(status_code=400, detail="FPS must be between 0 and 60")
+    if start_time is not None and start_time < 0:
+        raise HTTPException(status_code=400, detail="Start time must be non-negative")
+    if end_time is not None and end_time <= 0:
+        raise HTTPException(status_code=400, detail="End time must be positive")
+    if start_time is not None and end_time is not None and end_time <= start_time:
+        raise HTTPException(status_code=400, detail="End time must be after start time")
+    if matcher not in {"auto", "sequential", "exhaustive"}:
+        raise HTTPException(status_code=400, detail="Matcher must be auto, sequential, or exhaustive")
+    if colmap_use_gpu not in {0, 1}:
+        raise HTTPException(status_code=400, detail="COLMAP GPU must be 0 or 1")
+    if num_candidates < 1 or num_candidates > 16:
+        raise HTTPException(status_code=400, detail="Candidate count must be 1..16")
+    if ransac_iterations < 100 or ransac_iterations > 100000:
+        raise HTTPException(status_code=400, detail="RANSAC iterations must be 100..100000")
+
+    job_id = f"colmap-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    root = colmap_job_dir(job_id)
+    upload_plan = direct_upload_plan(files)
+    upload_plan.extend(staged_upload_plan(upload_ids, start_index=len(upload_plan)))
+    upload_plan.extend(existing_video_plan(existing_videos, start_index=len(upload_plan)))
+
+    raw_videos, work, proposals = reset_colmap_workspace(root)
+    try:
+        uploaded_names, source_manifest = await materialize_upload_plan(upload_plan, raw_videos)
+    except Exception:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+
+    (root / "source_manifest.json").write_text(
+        json.dumps(source_manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    scene = work / job_id / "scene"
+    job = {
+        "id": job_id,
+        "display_name": job_id,
+        "status": "queued",
+        "sample_fps": sample_fps,
+        "start_time": start_time,
+        "end_time": end_time,
+        "matcher": matcher,
+        "colmap_use_gpu": colmap_use_gpu,
+        "num_candidates": num_candidates,
+        "ransac_iterations": ransac_iterations,
+        "upload_count": len(uploaded_names),
+        "uploads": uploaded_names,
+        "source_manifest": source_manifest,
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "paths": {
+            "root": str(root),
+            "raw_videos": str(raw_videos),
+            "uploads": str(raw_videos),
+            "work": str(work),
+            "scene": str(scene),
+            "proposals": str(proposals),
+            "raw_videos_container": container_path(raw_videos),
+            "uploads_container": container_path(raw_videos),
+            "work_container": container_path(work),
+            "scene_container": container_path(scene),
+            "proposals_container": container_path(proposals),
+        },
+    }
+    with state_lock:
+        state = load_state()
+        state["colmap_jobs"][job_id] = job
+        save_state(state)
+
+    append_colmap_log(
+        job_id,
+        (
+            f"[frontend] Created COLMAP task {job_id}\n"
+            f"[frontend] Raw videos: {raw_videos}\n"
+            f"[frontend] Work dir: {work}\n"
+            f"[frontend] Proposals: {proposals}\n"
+            f"[frontend] Received {len(uploaded_names)} video file(s)\n"
+            f"[frontend] Source files: {', '.join(uploaded_names)}\n\n"
+        ),
+    )
+    threading.Thread(target=run_colmap_job, args=(job_id,), daemon=True).start()
+    return {"job": colmap_public(job)}
+
+
 @app.post("/api/jobs")
 async def create_job(request: Request) -> dict[str, Any]:
     try:
@@ -505,7 +1125,11 @@ async def create_job(request: Request) -> dict[str, Any]:
         log_job_request(f"multipart parse failed: {type(exc).__name__}: {exc}")
         raise
     files = form_uploads(form)
+    upload_ids = form_upload_ids(form)
+    existing_videos = form_existing_videos(form)
     model_id = form_string(form, "model_id")
+    source_type = form_string(form, "source_type", "video")
+    dataset_id = form_string(form, "dataset_id", "")
     sample_fps = form_float(form, "sample_fps")
     render_chunk_size = form_int(form, "render_chunk_size", 2)
     start_time = form_float(form, "start_time", None)
@@ -514,8 +1138,9 @@ async def create_job(request: Request) -> dict[str, Any]:
     log_job_request(
         (
             f"received multipart fields={list(form.keys())} "
-            f"files={len(files)} names={upload_names} "
-            f"model_id={model_id!r} sample_fps={sample_fps!r} "
+            f"files={len(files)} staged_uploads={len(upload_ids)} existing_videos={len(existing_videos)} names={upload_names} "
+            f"model_id={model_id!r} source_type={source_type!r} dataset_id={dataset_id!r} "
+            f"sample_fps={sample_fps!r} "
             f"render_chunk_size={render_chunk_size!r} "
             f"start_time={start_time!r} end_time={end_time!r}"
         )
@@ -523,11 +1148,18 @@ async def create_job(request: Request) -> dict[str, Any]:
 
     if model_id not in MODELS_BY_ID:
         reject_job_request(f"Unknown ReSplat model: {model_id!r}")
-    if not files:
-        reject_job_request("Upload at least one video")
-    if sample_fps is None:
+    if source_type not in {"video", "colmap"}:
+        reject_job_request("Unknown source type")
+    colmap_dataset = None
+    if source_type == "colmap":
+        if not dataset_id:
+            reject_job_request("Select a COLMAP dataset")
+        colmap_dataset = get_colmap_dataset(dataset_id)
+    elif not files and not upload_ids and not existing_videos:
+        reject_job_request("Select or upload at least one video")
+    if source_type == "video" and sample_fps is None:
         reject_job_request("sample_fps is required")
-    if sample_fps <= 0 or sample_fps > 60:
+    if source_type == "video" and (sample_fps <= 0 or sample_fps > 60):
         reject_job_request("FPS must be between 0 and 60")
     if render_chunk_size <= 0 or render_chunk_size > 32:
         reject_job_request("Render chunk size must be between 1 and 32")
@@ -542,31 +1174,17 @@ async def create_job(request: Request) -> dict[str, Any]:
     root = job_dir(job_id)
 
     upload_plan = []
-    for index, upload in enumerate(files):
-        filename = normalized_video_filename(upload, index)
-        upload_plan.append((index, upload, filename))
+    if source_type == "video":
+        upload_plan = direct_upload_plan(files)
+        upload_plan.extend(staged_upload_plan(upload_ids, start_index=len(upload_plan)))
+        upload_plan.extend(existing_video_plan(existing_videos, start_index=len(upload_plan)))
 
     raw_videos, work, results = reset_job_workspace(root)
 
     uploaded_names = []
     source_manifest = []
     try:
-        for index, upload, filename in upload_plan:
-            target = raw_videos / f"{index:03d}-{filename}"
-            bytes_written = 0
-            with target.open("wb") as handle:
-                while chunk := await upload.read(1024 * 1024):
-                    bytes_written += len(chunk)
-                    handle.write(chunk)
-            uploaded_names.append(target.name)
-            source_manifest.append(
-                {
-                    "index": index,
-                    "original_name": upload.filename,
-                    "stored_name": target.name,
-                    "bytes": bytes_written,
-                }
-            )
+        uploaded_names, source_manifest = await materialize_upload_plan(upload_plan, raw_videos)
     except Exception:
         shutil.rmtree(root, ignore_errors=True)
         raise
@@ -581,12 +1199,14 @@ async def create_job(request: Request) -> dict[str, Any]:
         "id": job_id,
         "display_name": job_id,
         "status": "queued",
+        "source_type": source_type,
         "model_id": model_id,
         "model_preset": MODELS_BY_ID[model_id]["preset"],
         "sample_fps": sample_fps,
         "render_chunk_size": render_chunk_size,
         "start_time": start_time,
         "end_time": end_time,
+        "colmap_dataset": colmap_dataset,
         "upload_count": len(uploaded_names),
         "uploads": uploaded_names,
         "source_manifest": source_manifest,
@@ -612,13 +1232,21 @@ async def create_job(request: Request) -> dict[str, Any]:
 
     append_log(
         job_id,
-        (
-            f"[frontend] Created isolated task {job_id}\n"
-            f"[frontend] Raw videos: {raw_videos}\n"
-            f"[frontend] Work dir: {work}\n"
-            f"[frontend] Results dir: {results}\n"
-            f"[frontend] Received {len(uploaded_names)} video file(s)\n"
-            f"[frontend] Source files: {', '.join(uploaded_names)}\n\n"
+        "".join(
+            [
+                f"[frontend] Created isolated task {job_id}\n",
+                f"[frontend] Source type: {source_type}\n",
+                (
+                    f"[frontend] COLMAP dataset: {colmap_dataset['id']} "
+                    f"candidate {colmap_dataset['candidate_id']}\n"
+                    if colmap_dataset else ""
+                ),
+                f"[frontend] Raw videos: {raw_videos}\n",
+                f"[frontend] Work dir: {work}\n",
+                f"[frontend] Results dir: {results}\n",
+                f"[frontend] Received {len(uploaded_names)} video file(s)\n",
+                f"[frontend] Source files: {', '.join(uploaded_names)}\n\n",
+            ]
         ),
     )
     threading.Thread(target=run_resplat_job, args=(job_id,), daemon=True).start()
@@ -659,6 +1287,111 @@ def get_file(job_id: str, filename: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="File not ready")
     media_type = "video/mp4" if filename == "video.mp4" else "application/octet-stream"
     return FileResponse(path, media_type=media_type, filename=filename)
+
+
+@app.get("/api/colmap-jobs/{job_id}")
+def get_colmap_job(job_id: str) -> dict[str, Any]:
+    with state_lock:
+        job = load_state()["colmap_jobs"].get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="COLMAP job not found")
+    return {"job": colmap_public(job)}
+
+
+@app.get("/api/colmap-jobs/{job_id}/logs")
+def get_colmap_logs(job_id: str) -> PlainTextResponse:
+    with state_lock:
+        exists = job_id in load_state()["colmap_jobs"]
+    if not exists:
+        raise HTTPException(status_code=404, detail="COLMAP job not found")
+    log_path = colmap_job_dir(job_id) / "run.log"
+    if not log_path.exists():
+        return PlainTextResponse("")
+    return PlainTextResponse(log_path.read_text(errors="replace"))
+
+
+@app.get("/api/colmap-jobs/{job_id}/files/{filename}")
+def get_colmap_file(job_id: str, filename: str) -> FileResponse:
+    safe_name = safe_slug(filename)
+    if safe_name != filename:
+        raise HTTPException(status_code=404, detail="File not found")
+    if filename not in COLMAP_ALLOWED_FILES and not re.fullmatch(r"candidate_\d{2}_zy\.png", filename):
+        raise HTTPException(status_code=404, detail="File not found")
+    with state_lock:
+        job = load_state()["colmap_jobs"].get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="COLMAP job not found")
+    path = Path(job["paths"]["proposals"]) / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not ready")
+    return FileResponse(path, media_type="image/png", filename=filename)
+
+
+@app.post("/api/colmap-jobs/{job_id}/align")
+def align_colmap_job(job_id: str, candidate_id: int = Form(...)) -> dict[str, Any]:
+    with state_lock:
+        job = load_state()["colmap_jobs"].get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="COLMAP job not found")
+    if job.get("status") not in {"proposed", "ready"}:
+        raise HTTPException(status_code=400, detail="COLMAP job has no ground proposals yet")
+    if candidate_id < 0 or candidate_id > 99:
+        raise HTTPException(status_code=400, detail="Invalid candidate id")
+
+    root = colmap_job_dir(job_id)
+    aligned_scene = root / f"aligned-candidate{candidate_id:02d}"
+    command = [
+        "python",
+        "scripts/align_colmap_ground.py",
+        "apply",
+        "--proposals",
+        f"{job['paths']['proposals_container']}/ground_proposals.json",
+        "--candidate_id",
+        str(candidate_id),
+        "--scene_path",
+        job["paths"]["scene_container"],
+        "--output_scene_path",
+        container_path(aligned_scene),
+        "--output_sparse_dir",
+        "sparse",
+        "--images_dir",
+        "images",
+        "--image_mode",
+        "copy",
+        "--overwrite",
+    ]
+
+    update_colmap_job(job_id, status="aligning", selected_candidate_id=candidate_id)
+    append_colmap_log(job_id, "\n$ " + " ".join(command) + "\n")
+    try:
+        exit_code = docker_exec_stream(
+            command,
+            lambda text: append_colmap_log(job_id, text),
+        )
+    except Exception as exc:
+        append_colmap_log(job_id, f"\n[frontend] {type(exc).__name__}: {exc}\n")
+        update_colmap_job(job_id, status="failed", error=str(exc), exit_code=None)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if exit_code != 0:
+        update_colmap_job(
+            job_id,
+            status="failed",
+            exit_code=exit_code,
+            error=f"Ground alignment exited with code {exit_code}",
+        )
+        raise HTTPException(status_code=500, detail=f"Ground alignment exited with code {exit_code}")
+
+    job = update_colmap_job(
+        job_id,
+        status="ready",
+        exit_code=0,
+        aligned_scene=str(aligned_scene),
+        aligned_scene_container=container_path(aligned_scene),
+        aligned_sparse_dir="sparse",
+        selected_candidate_id=candidate_id,
+    )
+    return {"job": colmap_public(job), "dataset": colmap_dataset_public(job)}
 
 
 @app.get("/api/panorama/{panorama_id}/files/{filename}")

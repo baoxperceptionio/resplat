@@ -94,6 +94,37 @@ def largest_colmap_reconstruction(sparse_dir: Path) -> Path:
     return best
 
 
+def run_final_bundle_adjustment(
+    mapper_output: Path,
+    ba_output: Path,
+    use_gpu: int,
+) -> Path:
+    reset_dir(ba_output, overwrite=True)
+    run(
+        [
+            "colmap",
+            "bundle_adjuster",
+            "--input_path",
+            str(mapper_output),
+            "--output_path",
+            str(ba_output),
+            "--BundleAdjustment.refine_focal_length",
+            "1",
+            "--BundleAdjustment.refine_principal_point",
+            "0",
+            "--BundleAdjustment.refine_extra_params",
+            "1",
+            "--BundleAdjustment.refine_points3D",
+            "1",
+            "--BundleAdjustmentCeres.max_num_iterations",
+            "200",
+            "--BundleAdjustmentCeres.use_gpu",
+            str(use_gpu),
+        ]
+    )
+    return ba_output
+
+
 def ffprobe_json(video: Path) -> dict:
     result = subprocess.run(
         [
@@ -298,6 +329,11 @@ def run_colmap(
     )
 
     mapper_output = largest_colmap_reconstruction(sparse_dir)
+    final_sparse = run_final_bundle_adjustment(
+        mapper_output,
+        colmap_dir / "sparse_ba" / "0",
+        use_gpu,
+    )
 
     run(
         [
@@ -306,7 +342,7 @@ def run_colmap(
             "--image_path",
             str(raw_images),
             "--input_path",
-            str(mapper_output),
+            str(final_sparse),
             "--output_path",
             str(scene_dir),
             "--output_type",
