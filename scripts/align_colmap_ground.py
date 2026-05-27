@@ -15,6 +15,7 @@ import collections
 import json
 import math
 import os
+import re
 import shutil
 import struct
 from pathlib import Path
@@ -92,18 +93,51 @@ def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
 
 def rotmat2qvec(rotmat: np.ndarray) -> np.ndarray:
     m = np.asarray(rotmat, dtype=np.float64)
-    k = np.array(
-        [
-            [m[0, 0] - m[1, 1] - m[2, 2], 0, 0, 0],
-            [m[1, 0] + m[0, 1], m[1, 1] - m[0, 0] - m[2, 2], 0, 0],
-            [m[2, 0] + m[0, 2], m[2, 1] + m[1, 2], m[2, 2] - m[0, 0] - m[1, 1], 0],
-            [m[1, 2] - m[2, 1], m[2, 0] - m[0, 2], m[0, 1] - m[1, 0], m[0, 0] + m[1, 1] + m[2, 2]],
-        ],
-        dtype=np.float64,
-    )
-    k /= 3.0
-    eigvals, eigvecs = np.linalg.eigh(k)
-    qvec = eigvecs[[3, 0, 1, 2], np.argmax(eigvals)]
+    trace = float(np.trace(m))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        qvec = np.array(
+            [
+                0.25 * scale,
+                (m[2, 1] - m[1, 2]) / scale,
+                (m[0, 2] - m[2, 0]) / scale,
+                (m[1, 0] - m[0, 1]) / scale,
+            ],
+            dtype=np.float64,
+        )
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        scale = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        qvec = np.array(
+            [
+                (m[2, 1] - m[1, 2]) / scale,
+                0.25 * scale,
+                (m[0, 1] + m[1, 0]) / scale,
+                (m[0, 2] + m[2, 0]) / scale,
+            ],
+            dtype=np.float64,
+        )
+    elif m[1, 1] > m[2, 2]:
+        scale = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        qvec = np.array(
+            [
+                (m[0, 2] - m[2, 0]) / scale,
+                (m[0, 1] + m[1, 0]) / scale,
+                0.25 * scale,
+                (m[1, 2] + m[2, 1]) / scale,
+            ],
+            dtype=np.float64,
+        )
+    else:
+        scale = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        qvec = np.array(
+            [
+                (m[1, 0] - m[0, 1]) / scale,
+                (m[0, 2] + m[2, 0]) / scale,
+                (m[1, 2] + m[2, 1]) / scale,
+                0.25 * scale,
+            ],
+            dtype=np.float64,
+        )
     if qvec[0] < 0:
         qvec *= -1
     return qvec / np.linalg.norm(qvec)
@@ -948,6 +982,208 @@ def transformed_points(points3d: dict[int, Point3D], transform: np.ndarray) -> d
     return out
 
 
+def project_points(
+    points: np.ndarray,
+    camera: ColmapCamera,
+    image: ColmapImage,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    w2c = np.eye(4, dtype=np.float64)
+    w2c[:3, :3] = qvec2rotmat(image.qvec)
+    w2c[:3, 3] = image.tvec
+    camera_points = points @ w2c[:3, :3].T + w2c[:3, 3]
+    z = camera_points[:, 2]
+    valid_depth = np.isfinite(camera_points).all(axis=1) & (z > 1e-6)
+    if not np.any(valid_depth):
+        return (
+            np.empty((0, 2), dtype=np.float64),
+            np.empty((0,), dtype=np.float64),
+            valid_depth,
+        )
+
+    x = camera_points[valid_depth, 0] / z[valid_depth]
+    y = camera_points[valid_depth, 1] / z[valid_depth]
+    params = camera.params
+
+    if camera.model == "PINHOLE":
+        fx, fy, cx, cy = params[:4]
+    elif camera.model == "SIMPLE_PINHOLE":
+        fx = fy = params[0]
+        cx, cy = params[1:3]
+    elif camera.model == "SIMPLE_RADIAL":
+        fx = fy = params[0]
+        cx, cy, k1 = params[1:4]
+        r2 = x * x + y * y
+        radial = 1.0 + k1 * r2
+        x = x * radial
+        y = y * radial
+    elif camera.model == "RADIAL":
+        fx = fy = params[0]
+        cx, cy, k1, k2 = params[1:5]
+        r2 = x * x + y * y
+        radial = 1.0 + k1 * r2 + k2 * r2 * r2
+        x = x * radial
+        y = y * radial
+    elif camera.model in {"OPENCV", "FULL_OPENCV"}:
+        fx, fy, cx, cy, k1, k2, p1, p2 = params[:8]
+        r2 = x * x + y * y
+        radial = 1.0 + k1 * r2 + k2 * r2 * r2
+        if camera.model == "FULL_OPENCV" and len(params) >= 12:
+            k3, k4, k5, k6 = params[8:12]
+            r4 = r2 * r2
+            r6 = r4 * r2
+            radial = (1.0 + k1 * r2 + k2 * r4 + k3 * r6) / (
+                1.0 + k4 * r2 + k5 * r4 + k6 * r6
+            )
+        x_tangential = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+        y_tangential = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+        x = x * radial + x_tangential
+        y = y * radial + y_tangential
+    else:
+        return None
+
+    uv = np.column_stack([fx * x + cx, fy * y + cy])
+    return uv, z[valid_depth], valid_depth
+
+
+def safe_debug_stem(value: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", Path(value).stem).strip(".-")
+    return stem[:80] or "image"
+
+
+def draw_reprojection_overlay(
+    image_path: Path,
+    output_path: Path,
+    uv: np.ndarray,
+    depth: np.ndarray,
+    rgb: np.ndarray,
+    image_name: str,
+) -> int:
+    from PIL import Image, ImageDraw
+
+    with Image.open(image_path) as source:
+        canvas = source.convert("RGB")
+    width, height = canvas.size
+    visible = (
+        np.isfinite(uv).all(axis=1)
+        & (uv[:, 0] >= 0.0)
+        & (uv[:, 0] < width)
+        & (uv[:, 1] >= 0.0)
+        & (uv[:, 1] < height)
+    )
+    if not np.any(visible):
+        projected = np.empty((0, 2), dtype=np.float64)
+        projected_depth = np.empty((0,), dtype=np.float64)
+        projected_rgb = np.empty((0, 3), dtype=np.uint8)
+    else:
+        projected = uv[visible]
+        projected_depth = depth[visible]
+        projected_rgb = rgb[visible]
+
+    draw = ImageDraw.Draw(canvas, "RGBA")
+    order = np.argsort(projected_depth)[::-1]
+    radius = max(4, int(round(min(width, height) / 280)))
+    for index in order:
+        x, y = projected[index]
+        color = tuple(int(c) for c in projected_rgb[index])
+        draw.ellipse(
+            (x - radius, y - radius, x + radius, y + radius),
+            fill=(*color, 85),
+            outline=(255, 255, 255, 190),
+            width=1,
+        )
+        draw.ellipse(
+            (x - radius + 1, y - radius + 1, x + radius - 1, y + radius - 1),
+            outline=(*color, 230),
+            width=2,
+        )
+
+    label = f"{image_name}  projected points: {len(projected)}"
+    pad = 7
+    text_box = draw.textbbox((0, 0), label)
+    box_w = text_box[2] - text_box[0] + pad * 2
+    box_h = text_box[3] - text_box[1] + pad * 2
+    draw.rectangle((0, 0, box_w, box_h), fill=(0, 0, 0, 165))
+    draw.text((pad, pad), label, fill=(255, 255, 255, 255))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path, quality=92, subsampling=1)
+    return int(len(projected))
+
+
+def write_reprojection_debug(
+    output_dir: Path,
+    image_root: Path,
+    cameras: dict[int, ColmapCamera],
+    images: dict[int, ColmapImage],
+    points3d: dict[int, Point3D],
+    *,
+    count: int,
+    max_points: int,
+    seed: int,
+) -> list[dict]:
+    if count <= 0:
+        return []
+    image_items = [
+        image
+        for image in images.values()
+        if image.camera_id in cameras and (image_root / image.name).exists()
+    ]
+    if not image_items:
+        return []
+
+    rng = np.random.default_rng(seed)
+    image_items = sorted(image_items, key=lambda item: item.name)
+    selected_indices = rng.choice(
+        len(image_items),
+        min(count, len(image_items)),
+        replace=False,
+    )
+    selected_images = [image_items[int(index)] for index in selected_indices]
+
+    point_ids, points = points_array(points3d)
+    colors = np.stack([points3d[int(point_id)].rgb for point_id in point_ids], axis=0)
+    if len(points) > max_points:
+        sample_indices = rng.choice(len(points), max_points, replace=False)
+        points = points[sample_indices]
+        colors = colors[sample_indices]
+
+    for old_image in list(output_dir.glob("reprojection_*.png")) + list(
+        output_dir.glob("reprojection_*.jpg")
+    ):
+        old_image.unlink()
+
+    manifest = []
+    for output_index, image in enumerate(selected_images):
+        projection = project_points(points, cameras[image.camera_id], image)
+        if projection is None:
+            continue
+        uv, depth, valid_depth = projection
+        image_name = image.name
+        output_name = f"reprojection_{output_index:02d}_{safe_debug_stem(image_name)}.jpg"
+        projected_count = draw_reprojection_overlay(
+            image_root / image_name,
+            output_dir / output_name,
+            uv,
+            depth,
+            colors[valid_depth],
+            image_name,
+        )
+        manifest.append(
+            {
+                "image": output_name,
+                "source_image": image_name,
+                "projected_count": projected_count,
+                "camera_id": int(image.camera_id),
+            }
+        )
+
+    (output_dir / "manifest.json").write_text(
+        json.dumps({"images": manifest}, indent=2),
+        encoding="utf-8",
+    )
+    return manifest
+
+
 def copy_images(src_scene: Path, dst_scene: Path, images_dir: str, mode: str) -> None:
     src = src_scene / images_dir
     dst = dst_scene / images_dir
@@ -1012,6 +1248,24 @@ def command_apply(args: argparse.Namespace) -> None:
             shutil.copy2(source, output_sparse_path / name)
 
     copy_images(scene_path, output_scene, args.images_dir, args.image_mode)
+    debug_dir = args.debug_reprojection_dir
+    if debug_dir is None:
+        debug_dir = output_scene / "debug_reprojection"
+    if args.debug_reprojection_count > 0:
+        try:
+            debug_items = write_reprojection_debug(
+                debug_dir,
+                output_scene / args.images_dir,
+                cameras,
+                new_images,
+                new_points,
+                count=args.debug_reprojection_count,
+                max_points=args.debug_reprojection_max_points,
+                seed=args.debug_reprojection_seed,
+            )
+            print(f"Wrote {len(debug_items)} reprojection debug image(s): {debug_dir}")
+        except Exception as exc:
+            print(f"Warning: failed to write reprojection debug images: {exc}")
     metadata = {
         "source_scene": str(scene_path),
         "source_sparse": str(sparse_path),
@@ -1019,6 +1273,7 @@ def command_apply(args: argparse.Namespace) -> None:
         "candidate": candidate,
         "output_sparse_dir": output_sparse_dir,
         "images_dir": args.images_dir,
+        "debug_reprojection_dir": str(debug_dir),
     }
     (output_scene / "ground_alignment.json").write_text(
         json.dumps(metadata, indent=2), encoding="utf-8"
@@ -1083,6 +1338,10 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--images_dir", default="images")
     apply.add_argument("--image_mode", choices=["symlink", "copy", "none"], default="symlink")
     apply.add_argument("--overwrite", action="store_true")
+    apply.add_argument("--debug_reprojection_dir", type=Path, default=None)
+    apply.add_argument("--debug_reprojection_count", type=int, default=5)
+    apply.add_argument("--debug_reprojection_max_points", type=int, default=120000)
+    apply.add_argument("--debug_reprojection_seed", type=int, default=17)
     apply.set_defaults(func=command_apply)
 
     return parser

@@ -969,7 +969,7 @@ def save_outputs(
 def render_smooth_video(
     gaussians, decoder, all_c2w_np, context_c2w, intrinsic_np,
     near, far, image_shape, output_dir,
-    render_chunk_size=10, fps=30, smooth_kernel=45,
+    render_chunk_size=10, fps=30.0, smooth_kernel=45,
     device="cuda",
 ):
     """Render a smooth video by smoothing all scene poses and rendering each frame.

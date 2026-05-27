@@ -389,6 +389,8 @@ def run_resplat(
         "--save_ply",
         "--render_chunk_size",
         str(args.render_chunk_size),
+        "--smooth_video_fps",
+        f"{args.sample_fps:g}",
         "--no_eval",
     ]
 

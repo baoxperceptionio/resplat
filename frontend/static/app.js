@@ -1,4 +1,4 @@
-import { SplatViewer } from "./viewer.js?v=20260527-batch-loader";
+import { SplatViewer } from "./viewer.js?v=20260527-camera-up-v2";
 
 const form = document.querySelector("#jobForm");
 const submitButton = document.querySelector("#submitButton");
@@ -161,6 +161,18 @@ function setDownload(link, url) {
   } else {
     link.href = "#";
     link.classList.add("disabled");
+  }
+}
+
+function setVideoPreviewSource(url) {
+  const currentUrl = videoPreview.getAttribute("src");
+  if (url) {
+    if (currentUrl !== url) {
+      videoPreview.src = url;
+    }
+  } else if (currentUrl) {
+    videoPreview.removeAttribute("src");
+    videoPreview.load();
   }
 }
 
@@ -353,8 +365,7 @@ function clearPipelineArtifacts(message = "") {
   viewerLoadToken += 1;
   setDownload(downloadVideo, null);
   setDownload(downloadPly, null);
-  videoPreview.removeAttribute("src");
-  videoPreview.load();
+  setVideoPreviewSource(null);
   logsEl.textContent = message;
   viewer?.clear();
   viewerEmpty.textContent = "3DGS viewer";
@@ -372,7 +383,9 @@ function jobSourceMeta(job) {
     const batches = job.resplat_mode === "batch_merge" && job.batch_count
       ? ` · ${job.batch_count} batches`
       : "";
-    return `COLMAP · ${mode} · ${dataset?.frame_count ?? 0} images${batches}`;
+    const fps = dataset?.sample_fps ?? job.sample_fps;
+    const fpsText = fps ? ` · ${fps} FPS` : "";
+    return `COLMAP · ${mode} · ${dataset?.frame_count ?? 0} images${fpsText}${batches}`;
   }
   return `${job.sample_fps} FPS · ${jobUploadCount(job)} video`;
 }
@@ -722,6 +735,11 @@ function colmapRenderKey(job) {
       candidate.angle_to_camera_up_deg,
       candidate.camera_yz_track_angle_deg,
     ]),
+    debug_reprojections: (job.debug_reprojections ?? []).map((item) => [
+      item.image_url,
+      item.source_image,
+      item.projected_count,
+    ]),
   });
 }
 
@@ -741,12 +759,7 @@ async function refreshActiveJob() {
   setDownload(downloadVideo, selection.artifacts.video);
   setDownload(downloadPly, selection.artifacts.ply);
 
-  if (selection.artifacts.video) {
-    videoPreview.src = selection.artifacts.video;
-  } else {
-    videoPreview.removeAttribute("src");
-    videoPreview.load();
-  }
+  setVideoPreviewSource(selection.artifacts.video);
 
   const logsResponse = await fetch(`/api/jobs/${job.id}/logs`, { cache: "no-store" });
   logsEl.textContent = await logsResponse.text();
@@ -837,6 +850,23 @@ function renderCandidates(job) {
     button.disabled = job.status === "running" || job.status === "aligning";
     button.addEventListener("click", () => alignCandidate(job.id, candidate.id));
     candidateGallery.appendChild(card);
+  }
+
+  if (job.debug_reprojections?.length) {
+    for (const item of job.debug_reprojections) {
+      const card = document.createElement("div");
+      card.className = "candidate-card reprojection-card";
+      const count = Number(item.projected_count ?? 0);
+      card.innerHTML = `
+        <img src="${item.image_url}" alt="reprojection ${item.source_image ?? ""}" loading="lazy" />
+        <div class="job-top">
+          <div class="job-id">重投影 debug</div>
+          <span class="status succeeded">已生成</span>
+        </div>
+        <div class="job-meta">${item.source_image ?? item.image} · ${count.toLocaleString()} projected points</div>
+      `;
+      candidateGallery.appendChild(card);
+    }
   }
 }
 

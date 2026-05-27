@@ -31,6 +31,7 @@ export class SplatViewer {
       position: this.camera.position.clone(),
       target: this.controls.target.clone(),
       fov: this.camera.fov,
+      up: this.camera.up.clone(),
     };
     this.baseMoveSpeed = 1.0;
 
@@ -79,14 +80,15 @@ export class SplatViewer {
 
     const forward = new THREE.Vector3();
     this.camera.getWorldDirection(forward);
-    forward.y = 0;
+    const up = this.camera.up.clone().normalize();
+    forward.addScaledVector(up, -forward.dot(up));
     if (forward.lengthSq() < 1e-6) {
-      forward.set(0, 0, -1);
+      forward.set(Math.abs(up.y) < 0.9 ? 0 : 1, Math.abs(up.y) < 0.9 ? 1 : 0, 0);
+      forward.addScaledVector(up, -forward.dot(up));
     }
     forward.normalize();
 
-    const right = new THREE.Vector3().crossVectors(forward, this.camera.up).normalize();
-    const up = new THREE.Vector3(0, 1, 0);
+    const right = new THREE.Vector3().crossVectors(forward, up).normalize();
     const movement = new THREE.Vector3();
 
     if (this.keys.has("w")) movement.add(forward);
@@ -111,6 +113,7 @@ export class SplatViewer {
     this.camera.position.copy(this.defaultView.position);
     this.controls.target.copy(this.defaultView.target);
     this.camera.fov = this.defaultView.fov;
+    this.camera.up.copy(this.defaultView.up);
     this.camera.updateProjectionMatrix();
     this.controls.update();
   }
@@ -159,6 +162,7 @@ export class SplatViewer {
     }
     this.camera.position.copy(this.defaultView.position);
     this.camera.fov = this.defaultView.fov;
+    this.camera.up.copy(this.defaultView.up);
     this.camera.updateProjectionMatrix();
     this.controls.target.copy(this.defaultView.target);
     this.controls.update();
@@ -177,11 +181,13 @@ export class SplatViewer {
     mesh.position.sub(center);
     const radius = Math.max(size.x, size.y, size.z, 0.5);
     this.camera.fov = 60;
+    this.camera.up.set(0, 1, 0);
     this.camera.position.set(0, 0, Math.max(2.2, radius * 1.8));
     this.controls.target.set(0, 0, 0);
     this.defaultView.position.copy(this.camera.position);
     this.defaultView.target.copy(this.controls.target);
     this.defaultView.fov = this.camera.fov;
+    this.defaultView.up.copy(this.camera.up);
     this.baseMoveSpeed = Math.max(0.35, radius * 0.45);
     this.controls.update();
   }
@@ -220,6 +226,7 @@ export class SplatViewer {
 
     this.camera.position.setFromMatrixPosition(cameraWorld);
     this.camera.quaternion.setFromRotationMatrix(cameraWorld);
+    this.camera.up.setFromMatrixColumn(cameraWorld, 1).normalize();
     this.camera.updateMatrixWorld(true);
     this.camera.updateProjectionMatrix();
 
@@ -230,6 +237,7 @@ export class SplatViewer {
     this.defaultView.position.copy(this.camera.position);
     this.defaultView.target.copy(this.controls.target);
     this.defaultView.fov = this.camera.fov;
+    this.defaultView.up.copy(this.camera.up);
     this.controls.update();
     return true;
   }

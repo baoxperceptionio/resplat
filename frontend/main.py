@@ -656,7 +656,42 @@ def colmap_public(job: dict[str, Any]) -> dict[str, Any]:
         else None
     )
     enriched["dataset_ready"] = bool(job.get("aligned_scene"))
+    enriched["debug_reprojections"] = colmap_debug_reprojections_public(job)
     return enriched
+
+
+def colmap_debug_reprojections_public(job: dict[str, Any]) -> list[dict[str, Any]]:
+    aligned_scene = job.get("aligned_scene")
+    if not aligned_scene:
+        return []
+    debug_dir = Path(aligned_scene) / "debug_reprojection"
+    manifest_path = debug_dir / "manifest.json"
+    if not manifest_path.exists():
+        return []
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except Exception:
+        return []
+
+    items = []
+    for item in manifest.get("images", []):
+        image_name = item.get("image")
+        if not image_name or safe_slug(image_name) != image_name:
+            continue
+        path = debug_dir / image_name
+        if not path.exists() or not re.fullmatch(r"reprojection_\d{2}_[A-Za-z0-9_.-]+\.jpg", image_name):
+            continue
+        version = artifact_version(path)
+        items.append(
+            {
+                "image": image_name,
+                "source_image": item.get("source_image"),
+                "projected_count": item.get("projected_count"),
+                "camera_id": item.get("camera_id"),
+                "image_url": f"/api/colmap-jobs/{job['id']}/debug/{image_name}?v={version}",
+            }
+        )
+    return items
 
 
 def model_public(model: dict[str, Any]) -> dict[str, Any]:
@@ -676,6 +711,9 @@ def colmap_dataset_public(job: dict[str, Any]) -> dict[str, Any] | None:
         "id": job["id"],
         "label": f"{job['id']} · candidate {job.get('selected_candidate_id')}",
         "frame_count": job.get("frame_count", 0),
+        "sample_fps": job.get("sample_fps"),
+        "start_time": job.get("start_time"),
+        "end_time": job.get("end_time"),
         "candidate_id": job.get("selected_candidate_id"),
         "scene": str(scene_path),
         "scene_container": job.get("aligned_scene_container") or container_path(scene_path),
@@ -967,6 +1005,7 @@ def run_resplat_job(job_id: str) -> None:
         if job.get("source_type") == "colmap":
             dataset = job["colmap_dataset"]
             frame_count = max(1, int(dataset.get("frame_count") or 1))
+            smooth_video_fps = float(job.get("sample_fps") or dataset.get("sample_fps") or 30)
             if job.get("resplat_mode") == "batch_merge":
                 command = [
                     "python",
@@ -987,6 +1026,8 @@ def run_resplat_job(job_id: str) -> None:
                     str(job["batch_overlap"]),
                     "--render_chunk_size",
                     str(job["render_chunk_size"]),
+                    "--video_fps",
+                    f"{smooth_video_fps:g}",
                 ]
             else:
                 command = [
@@ -1013,6 +1054,8 @@ def run_resplat_job(job_id: str) -> None:
                     "--save_ply",
                     "--render_chunk_size",
                     str(job["render_chunk_size"]),
+                    "--smooth_video_fps",
+                    f"{smooth_video_fps:g}",
                     "--no_eval",
                 ]
                 if frame_count < int(model["views"]):
@@ -1900,7 +1943,7 @@ async def create_job(request: Request) -> dict[str, Any]:
         "batch_overlap": batch_overlap if resplat_mode == "batch_merge" else None,
         "batch_count": batch_count if resplat_mode == "batch_merge" else None,
         "batch_manifest": None,
-        "sample_fps": sample_fps,
+        "sample_fps": colmap_dataset.get("sample_fps") if colmap_dataset else sample_fps,
         "render_chunk_size": render_chunk_size,
         "start_time": start_time,
         "end_time": end_time,
@@ -2051,6 +2094,24 @@ def get_colmap_file(job_id: str, filename: str) -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail="File not ready")
     return FileResponse(path, media_type="image/png", filename=filename)
+
+
+@app.get("/api/colmap-jobs/{job_id}/debug/{filename}")
+def get_colmap_debug_file(job_id: str, filename: str) -> FileResponse:
+    safe_name = safe_slug(filename)
+    if safe_name != filename or not re.fullmatch(r"reprojection_\d{2}_[A-Za-z0-9_.-]+\.jpg", filename):
+        raise HTTPException(status_code=404, detail="File not found")
+    with state_lock:
+        job = load_state()["colmap_jobs"].get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="COLMAP job not found")
+    aligned_scene = job.get("aligned_scene")
+    if not aligned_scene:
+        raise HTTPException(status_code=404, detail="Debug images not ready")
+    path = Path(aligned_scene) / "debug_reprojection" / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not ready")
+    return FileResponse(path, media_type="image/jpeg", filename=filename)
 
 
 @app.post("/api/colmap-jobs/{job_id}/align")

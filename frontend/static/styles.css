@@ -779,6 +779,10 @@ body.resizing {
   object-fit: contain;
 }
 
+.candidate-card.reprojection-card img {
+  aspect-ratio: 16 / 9;
+}
+
 .candidate-card button {
   width: 100%;
 }
