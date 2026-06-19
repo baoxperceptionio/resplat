@@ -17,7 +17,11 @@ const logsEl = document.querySelector("#logs");
 const videoPreview = document.querySelector("#videoPreview");
 const downloadVideo = document.querySelector("#downloadVideo");
 const downloadPly = document.querySelector("#downloadPly");
+const downloadGsplatPly = document.querySelector("#downloadGsplatPly");
 const toggleOutputPane = document.querySelector("#toggleOutputPane");
+const gsplatButton = document.querySelector("#gsplatButton");
+const gsplatStepsField = document.querySelector("#gsplatStepsField");
+const gsplatStepsInput = document.querySelector("#gsplatSteps");
 const pipelineActions = document.querySelector(".actions");
 const viewerEmpty = document.querySelector("#viewerEmpty");
 const panoramaForm = document.querySelector("#panoramaForm");
@@ -365,6 +369,7 @@ function clearPipelineArtifacts(message = "") {
   viewerLoadToken += 1;
   setDownload(downloadVideo, null);
   setDownload(downloadPly, null);
+  setDownload(downloadGsplatPly, null);
   setVideoPreviewSource(null);
   logsEl.textContent = message;
   viewer?.clear();
@@ -386,7 +391,8 @@ function jobSourceMeta(job) {
     const fps = dataset?.sample_fps ?? job.sample_fps;
     const fpsText = fps ? ` · 抽帧 ${fps} FPS` : "";
     const outputFpsText = job.output_video_fps ? ` · 输出 ${job.output_video_fps} FPS` : "";
-    return `COLMAP · ${mode} · ${dataset?.frame_count ?? 0} images${fpsText}${outputFpsText}${batches}`;
+    const gsplatText = job.gsplat_status ? ` · gsplat ${statusText[job.gsplat_status] ?? job.gsplat_status}` : "";
+    return `COLMAP · ${mode} · ${dataset?.frame_count ?? 0} images${fpsText}${outputFpsText}${batches}${gsplatText}`;
   }
   return `${job.sample_fps} FPS · ${jobUploadCount(job)} video`;
 }
@@ -428,6 +434,42 @@ function activeJobSelection(job) {
     meta: batchMeta(batch),
     artifacts: batch.artifacts,
   };
+}
+
+function displayArtifactsForJob(job, artifacts) {
+  if (job.gsplat_status === "succeeded" && job.gsplat_artifacts?.viewer_ply) {
+    return {
+      ...artifacts,
+      ply: job.gsplat_artifacts.ply,
+      viewer_ply: job.gsplat_artifacts.viewer_ply,
+      viewer_ply_version: job.gsplat_artifacts.viewer_ply_version,
+      initial_camera: job.gsplat_artifacts.initial_camera ?? artifacts.initial_camera,
+    };
+  }
+  return artifacts;
+}
+
+function updateGsplatButton(job) {
+  const imageCount = job?.colmap_dataset?.frame_count ?? 0;
+  const canRun = Boolean(
+    job
+    && job.status === "succeeded"
+    && job.source_type === "colmap"
+    && job.artifacts?.ply
+    && imageCount > 0
+  );
+  gsplatButton.hidden = !canRun;
+  gsplatStepsField.hidden = !canRun;
+  if (!canRun) {
+    gsplatButton.disabled = true;
+    gsplatButton.textContent = "gsplat";
+    return;
+  }
+  const gsplatStatus = job.gsplat_status;
+  const suffix = gsplatStatus === "succeeded" ? "重新运行" : "gsplat";
+  gsplatButton.textContent = `${suffix} with ${imageCount} images`;
+  gsplatButton.disabled = gsplatStatus === "running" || gsplatStatus === "queued";
+  gsplatStepsInput.disabled = gsplatButton.disabled;
 }
 
 function buildJobFormData(uploadIds = []) {
@@ -750,15 +792,20 @@ async function refreshActiveJob() {
   }
   const job = jobs.find((item) => item.id === activeJobId);
   if (!job) {
+    updateGsplatButton(null);
     return;
   }
 
   activeTitle.textContent = job.id;
   const selection = activeJobSelection(job);
   activeTitle.textContent = selection.title;
-  activeMeta.textContent = selection.meta;
+  const displayArtifacts = displayArtifactsForJob(job, selection.artifacts);
+  const gsplatDone = job.gsplat_status === "succeeded" && job.gsplat_artifacts?.viewer_ply;
+  activeMeta.textContent = gsplatDone ? `${selection.meta} · gsplat PLY` : selection.meta;
+  updateGsplatButton(job);
   setDownload(downloadVideo, selection.artifacts.video);
   setDownload(downloadPly, selection.artifacts.ply);
+  setDownload(downloadGsplatPly, job.gsplat_artifacts?.ply ?? null);
 
   setVideoPreviewSource(selection.artifacts.video);
 
@@ -766,8 +813,8 @@ async function refreshActiveJob() {
   logsEl.textContent = await logsResponse.text();
   logsEl.scrollTop = logsEl.scrollHeight;
 
-  const viewerPly = selection.artifacts.viewer_ply ?? selection.artifacts.ply;
-  const initialCamera = selection.artifacts.initial_camera ?? null;
+  const viewerPly = displayArtifacts.viewer_ply ?? displayArtifacts.ply;
+  const initialCamera = displayArtifacts.initial_camera ?? null;
   const initialCameraKey = initialCamera ? JSON.stringify(initialCamera) : null;
   if (viewerPly && loadedPlyUrl !== viewerPly && loadingPlyUrl !== viewerPly) {
     viewer ??= new SplatViewer(document.querySelector("#viewer"));
@@ -915,6 +962,37 @@ async function alignCandidate(jobId, candidateId) {
   await refreshColmapJobs();
 }
 
+async function startGsplatRefine() {
+  if (!activeJobId) {
+    return;
+  }
+  gsplatButton.disabled = true;
+  logsEl.textContent += `\n[frontend] 启动 gsplat refinement...\n`;
+  try {
+    const formData = new FormData();
+    formData.set("steps", gsplatStepsInput.value || "20000");
+    const response = await fetch(`/api/jobs/${activeJobId}/gsplat`, {
+      method: "POST",
+      body: formData,
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || "gsplat refinement failed to start");
+    }
+    const index = jobs.findIndex((job) => job.id === data.job.id);
+    if (index >= 0) {
+      jobs[index] = data.job;
+    }
+    renderJobs();
+    await refreshActiveJob();
+  } catch (error) {
+    logsEl.textContent += `\n[frontend] ${error.message}\n`;
+  } finally {
+    const job = jobs.find((item) => item.id === activeJobId);
+    updateGsplatButton(job);
+  }
+}
+
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   submitButton.disabled = true;
@@ -958,6 +1036,7 @@ colmapVideoMode.addEventListener("change", updateVideoModes);
 toggleOutputPane.addEventListener("click", () => {
   setOutputCollapsed(!pipelineWorkspace.classList.contains("viewer-maximized"));
 });
+gsplatButton.addEventListener("click", startGsplatRefine);
 
 colmapForm.addEventListener("submit", async (event) => {
   event.preventDefault();

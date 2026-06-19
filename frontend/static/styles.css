@@ -82,6 +82,29 @@ select,
   gap: 12px;
 }
 
+.actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.inline-number {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 40px;
+}
+
+.inline-number span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.inline-number input {
+  width: 112px;
+  min-height: 36px;
+}
+
 .brand h1,
 .section-head h2 {
   margin: 0;

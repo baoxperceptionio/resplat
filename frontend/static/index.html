@@ -252,9 +252,15 @@
             <span id="activeMeta">上传视频后会在这里显示产物</span>
           </div>
           <div class="actions">
+            <label id="gsplatStepsField" class="inline-number" hidden>
+              <span>轮数</span>
+              <input id="gsplatSteps" type="number" min="1" max="1000000" step="1000" value="20000" />
+            </label>
+            <button id="gsplatButton" class="button ghost" type="button" hidden>gsplat</button>
             <button id="toggleOutputPane" class="button ghost" type="button">展开 3DGS</button>
             <a id="downloadVideo" class="button ghost disabled" href="#" download>下载 video.mp4</a>
             <a id="downloadPly" class="button ghost disabled" href="#" download>下载 gaussians.ply</a>
+            <a id="downloadGsplatPly" class="button ghost disabled" href="#" download>下载 guassian_gsplat.ply</a>
           </div>
         </div>
 
@@ -302,6 +308,6 @@
       </section>
     </main>
 
-    <script type="module" src="/app.js?v=20260527-reprojection-debug"></script>
+    <script type="module" src="/app.js?v=20260527-gsplat-refine"></script>
   </body>
 </html>

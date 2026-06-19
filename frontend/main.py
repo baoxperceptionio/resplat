@@ -32,6 +32,8 @@ UPLOAD_ROOT = JOB_ROOT / "uploads"
 RESPLAT_CONTAINER = os.getenv("RESPLAT_CONTAINER", "resplat")
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "1")))
 OUTPUT_VIDEO_FPS = float(os.getenv("RESPLAT_OUTPUT_VIDEO_FPS", "30"))
+GSPLAT_REFINE_STEPS = max(1, int(os.getenv("GSPLAT_REFINE_STEPS", "20000")))
+GSPLAT_REFINE_BATCH_SIZE = max(1, int(os.getenv("GSPLAT_REFINE_BATCH_SIZE", "1")))
 STATE_PATH = JOB_ROOT / "jobs.json"
 PANORAMA_ROOT = JOB_ROOT / "panorama"
 SEEDANCE_START_URL = "https://video.a2e.ai/api/v1/seedance2Video/start"
@@ -588,12 +590,19 @@ def job_public(job: dict[str, Any]) -> dict[str, Any]:
     video_path = result_dir / "video.mp4"
     ply_path = result_dir / "gaussians.ply"
     preview_ply_path = result_dir / "gaussians_preview.ply"
+    gsplat_dir = result_dir / "gsplat"
+    gsplat_ply_path = gsplat_dir / "guassian_gsplat.ply"
+    gsplat_preview_ply_path = gsplat_dir / "guassian_gsplat_preview.ply"
     enriched = dict(job)
     enriched.setdefault("output_video_fps", OUTPUT_VIDEO_FPS)
+    enriched.setdefault("gsplat_status", None)
     manifest_path = result_dir / "batch_manifest.json"
+    gsplat_manifest_path = gsplat_dir / "gsplat_manifest.json"
     video_version = None
     ply_version = None
     preview_ply_version = None
+    gsplat_ply_version = None
+    gsplat_preview_ply_version = None
     if video_path.exists():
         stat = video_path.stat()
         video_version = f"{int(stat.st_mtime_ns)}-{stat.st_size}"
@@ -603,6 +612,12 @@ def job_public(job: dict[str, Any]) -> dict[str, Any]:
     if preview_ply_path.exists():
         stat = preview_ply_path.stat()
         preview_ply_version = f"{int(stat.st_mtime_ns)}-{stat.st_size}"
+    if gsplat_ply_path.exists():
+        stat = gsplat_ply_path.stat()
+        gsplat_ply_version = f"{int(stat.st_mtime_ns)}-{stat.st_size}"
+    if gsplat_preview_ply_path.exists():
+        stat = gsplat_preview_ply_path.stat()
+        gsplat_preview_ply_version = f"{int(stat.st_mtime_ns)}-{stat.st_size}"
     if manifest_path.exists() and not enriched.get("batch_manifest"):
         try:
             enriched["batch_manifest"] = json.loads(manifest_path.read_text())
@@ -623,6 +638,28 @@ def job_public(job: dict[str, Any]) -> dict[str, Any]:
         "video_version": video_version,
         "ply_version": ply_version,
         "viewer_ply_version": preview_ply_version or ply_version,
+        "initial_camera": initial_camera_for_job(job, 0),
+    }
+    if gsplat_manifest_path.exists() and not enriched.get("gsplat_manifest"):
+        try:
+            enriched["gsplat_manifest"] = json.loads(gsplat_manifest_path.read_text())
+        except Exception:
+            pass
+    enriched["gsplat_artifacts"] = {
+        "ply": (
+            f"/api/jobs/{job['id']}/gsplat/files/guassian_gsplat.ply?v={gsplat_ply_version}"
+            if gsplat_ply_version else None
+        ),
+        "viewer_ply": (
+            f"/api/jobs/{job['id']}/gsplat/files/guassian_gsplat_preview.ply?v={gsplat_preview_ply_version}"
+            if gsplat_preview_ply_version
+            else (
+                f"/api/jobs/{job['id']}/gsplat/files/guassian_gsplat.ply?v={gsplat_ply_version}"
+                if gsplat_ply_version else None
+            )
+        ),
+        "ply_version": gsplat_ply_version,
+        "viewer_ply_version": gsplat_preview_ply_version or gsplat_ply_version,
         "initial_camera": initial_camera_for_job(job, 0),
     }
     return enriched
@@ -1151,6 +1188,98 @@ def run_resplat_job(job_id: str) -> None:
             )
 
 
+def run_gsplat_job(job_id: str) -> None:
+    with run_semaphore:
+        with state_lock:
+            job = load_state()["jobs"].get(job_id)
+        if job is None:
+            return
+
+        update_job(job_id, gsplat_status="running", gsplat_started_at=utc_now(), gsplat_error=None)
+        result_dir = Path(job["paths"]["results"])
+        gsplat_dir = result_dir / "gsplat"
+        gsplat_dir.mkdir(parents=True, exist_ok=True)
+
+        dataset = job["colmap_dataset"]
+        model = MODELS_BY_ID[job["model_id"]]
+        frame_count = max(1, int(dataset.get("frame_count") or 1))
+        context_count = min(int(model["views"]), frame_count)
+        pose_space = "global" if job.get("resplat_mode") == "batch_merge" else "resplat_single"
+
+        steps = max(1, int(job.get("gsplat_steps") or GSPLAT_REFINE_STEPS))
+        batch_size = max(1, int(job.get("gsplat_batch_size") or GSPLAT_REFINE_BATCH_SIZE))
+
+        command = [
+            "python",
+            "scripts/gsplat_refine_colmap.py",
+            "--scene_path",
+            dataset["scene_container"],
+            "--images_dir",
+            "images",
+            "--sparse_dir",
+            dataset.get("sparse_dir", "sparse"),
+            "--init_ply",
+            f"{job['paths']['results_container']}/gaussians.ply",
+            "--output_dir",
+            f"{job['paths']['results_container']}/gsplat",
+            "--steps",
+            str(steps),
+            "--batch_size",
+            str(batch_size),
+            "--num_context",
+            str(context_count),
+            "--pose_space",
+            pose_space,
+        ]
+        shape = PRESET_SHAPES.get(model["preset"])
+        if shape is not None:
+            command.extend(["--image_shape", str(shape[0]), str(shape[1])])
+
+        append_log(
+            job_id,
+            (
+                "\n[frontend] Starting gsplat refinement with "
+                f"{frame_count} images, steps={steps}, "
+                f"batch_size={batch_size}, pose_space={pose_space}\n"
+                "$ " + " ".join(command) + "\n"
+            ),
+        )
+        try:
+            exit_code = docker_exec_stream(command, lambda text: append_log(job_id, text))
+            if exit_code == 0:
+                try:
+                    if create_gaussian_ply_preview(
+                        gsplat_dir / "guassian_gsplat.ply",
+                        gsplat_dir / "guassian_gsplat_preview.ply",
+                    ):
+                        append_log(job_id, "\n[frontend] Wrote gsplat guassian_gsplat_preview.ply for browser viewer.\n")
+                except Exception as exc:
+                    append_log(job_id, f"\n[frontend] Failed to write gsplat viewer preview PLY: {exc}\n")
+                update_job(
+                    job_id,
+                    gsplat_status="succeeded",
+                    gsplat_finished_at=utc_now(),
+                    gsplat_exit_code=exit_code,
+                )
+            else:
+                update_job(
+                    job_id,
+                    gsplat_status="failed",
+                    gsplat_finished_at=utc_now(),
+                    gsplat_exit_code=exit_code,
+                    gsplat_error=f"gsplat exited with code {exit_code}",
+                )
+        except Exception as exc:
+            append_log(job_id, f"\n[frontend] gsplat {type(exc).__name__}: {exc}\n")
+            update_job(
+                job_id,
+                gsplat_status="failed",
+                gsplat_finished_at=utc_now(),
+                gsplat_exit_code=None,
+                gsplat_error=str(exc),
+            )
+
+
 def docker_exec_stream(command: list[str], log_fn, workdir: Path = REPO_ROOT) -> int:
     client = docker.from_env()
     container = client.containers.get(RESPLAT_CONTAINER)
@@ -1279,6 +1408,10 @@ def prepare_storage() -> None:
             if job.get("status") in {"queued", "running"}:
                 job["status"] = "interrupted"
                 job["error"] = "Frontend restarted while this job was active."
+                job["updated_at"] = utc_now()
+            if job.get("gsplat_status") == "running":
+                job["gsplat_status"] = "interrupted"
+                job["gsplat_error"] = "Frontend restarted while this gsplat job was active."
                 job["updated_at"] = utc_now()
         for job in state.get("colmap_jobs", {}).values():
             if job.get("status") in {"queued", "running"}:
@@ -2044,6 +2177,53 @@ def get_file(request: Request, job_id: str, filename: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="File not ready")
     media_type = "video/mp4" if filename == "video.mp4" else "application/octet-stream"
     return FileResponse(path, media_type=media_type, filename=filename)
+
+
+@app.post("/api/jobs/{job_id}/gsplat")
+def start_gsplat_refine(job_id: str, steps: int | None = Form(None)) -> dict[str, Any]:
+    with state_lock:
+        job = load_state()["jobs"].get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") != "succeeded":
+        raise HTTPException(status_code=400, detail="ReSplat job must finish before gsplat refinement")
+    if job.get("source_type") != "colmap" or not job.get("colmap_dataset"):
+        raise HTTPException(status_code=400, detail="gsplat refinement requires a saved COLMAP dataset")
+    if job.get("gsplat_status") == "running":
+        raise HTTPException(status_code=400, detail="gsplat refinement is already running")
+    if not (Path(job["paths"]["results"]) / "gaussians.ply").exists():
+        raise HTTPException(status_code=400, detail="ReSplat gaussians.ply is not ready")
+    requested_steps = steps if steps is not None else GSPLAT_REFINE_STEPS
+    if requested_steps < 1 or requested_steps > 1_000_000:
+        raise HTTPException(status_code=400, detail="gsplat steps must be between 1 and 1000000")
+
+    update_job(
+        job_id,
+        gsplat_status="queued",
+        gsplat_requested_at=utc_now(),
+        gsplat_steps=requested_steps,
+        gsplat_batch_size=GSPLAT_REFINE_BATCH_SIZE,
+        gsplat_error=None,
+    )
+    append_log(job_id, f"\n[frontend] Queued gsplat refinement for job {job_id}\n")
+    threading.Thread(target=run_gsplat_job, args=(job_id,), daemon=True).start()
+    with state_lock:
+        updated = load_state()["jobs"][job_id]
+    return {"job": job_public(updated)}
+
+
+@app.get("/api/jobs/{job_id}/gsplat/files/{filename}")
+def get_gsplat_file(job_id: str, filename: str) -> FileResponse:
+    if filename not in {"guassian_gsplat.ply", "guassian_gsplat_preview.ply"}:
+        raise HTTPException(status_code=404, detail="File not found")
+    with state_lock:
+        job = load_state()["jobs"].get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    path = Path(job["paths"]["results"]) / "gsplat" / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not ready")
+    return FileResponse(path, media_type="application/octet-stream", filename=filename)
 
 
 @app.get("/api/jobs/{job_id}/batches/{batch_index}/files/{filename}")
